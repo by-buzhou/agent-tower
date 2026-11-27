@@ -1,5 +1,11 @@
 # AgentTower v0.3.3.2
 
+<p>
+  <a href="https://linux.do?ref=seal-click" target="_blank" rel="noopener noreferrer" title="Powered by LINUX DO">
+    <img src="https://linuxdo-seal.cuishushu.com/seals/seal-powered-by.svg" alt="Powered by LINUX DO" width="180" height="55" />
+  </a>
+</p>
+
 专为 **Antigravity** 打造的多 Agent 协作编程插件 —— 充分发挥 **Gemini 4** 语言理解与表达优势，在 **AgentTower** 本地面板一站式完成多路派单、军师会审与代码审改。
 
 ---

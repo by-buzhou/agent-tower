@@ -13,7 +13,6 @@ const LEGACY_EXAMPLE = Symbol("legacy example");
 const legacyExampleText = kind => `---\nid: example\ntitle: ${kind} 规范示例\nkind: ${kind}\nrequired: false\nscopes: []\ntags: []\nsummary: 填写适用范围和项目规则。\n---\n\n请在此填写项目约定。\n`;
 const ID = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 const WINDOWS_DEVICE_NAME = /^(?:con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³])(?:\.|$)/i;
-const BUDGET = 16_384;
 const ARGV_BUDGET = 2048;
 const PLAN_BUDGET = 24 * 1024;
 export const DEFAULT_SPEC_SINGLE_KB = 2;
@@ -736,7 +735,7 @@ export function buildCuratorStaticProbe(root, { curatedHead = "", specLimits } =
   const deadSymbols = specs.length ? scanSuspectedDeadSymbols(root, specs, files) : [];
   const deadLabel = partial ? "待核实未命中路标候选（文件扫描部分截断，请点读确认）" : "失效死路标告警（匹配不到真实文件或单测，请修正或删废规）";
   const lines = [
-    specs.length && `- 规范总水位：共 ${specs.length} 篇（业务 ${bizCount}/16、编码 ${codCount}/10，必读 ${reqCount} 篇），总正文 ${totalBytes}B / ${limits.totalMaxBytes}B（${Math.round((totalBytes * 100) / limits.totalMaxBytes)}%）`,
+    specs.length && `- 规范总水位：共 ${specs.length} 篇（业务 ${bizCount}/16、编码 ${codCount}/10，必读 ${reqCount} 篇），单篇上限 ${limits.singleMaxBytes}B，总正文 ${totalBytes}B / ${limits.totalMaxBytes}B（${Math.round((totalBytes * 100) / limits.totalMaxBytes)}%）`,
     changed.length && `- 近期变更文件(${changed.length})：${changed.slice(0, 10).join(", ")}${changed.length > 10 ? " ..." : ""}`,
     drift.length && `- 疑似漂移规范（改动命中 scopes，请优先核对是否冲突过期）：${drift.slice(0, 6).join("；")}`,
     dead.length && `- ${deadLabel}：${dead.slice(0, 6).join("；")}`,
@@ -843,7 +842,7 @@ export function assembleSpecPrompt({ inventory, cwd, repoRoot = cwd, role, rawPr
     const plan = assemblePlanPrompt({ cwd, repoRoot, planDoc: planDoc ?? null, role, ledger: previous, transport,
       remainingBytes: argv ? ARGV_BUDGET - argvReserve - (plugin && !pluginReused ? cost(plugin.body) : 0) - (disabledReceipts.length ? cost(disabledNotice) : 0) : undefined });
     issues.push(...plan.warnings);
-    let budget = argv ? Math.max(0, ARGV_BUDGET - argvReserve - bytes(plan.prompt)) : BUDGET;
+    let budget = argv ? Math.max(0, ARGV_BUDGET - argvReserve - bytes(plan.prompt)) : limits.totalMaxBytes;
     let argvCapped = false;
     function addArgvChunk(text) {
       const size = cost(text);
@@ -1120,7 +1119,8 @@ export function projectSpecStatus(root, { specId, includeBody = false, repoRoot 
     }
   };
   const docs = projectDocFlags(root, repoRoot);
-  const pluginCards = Object.keys(ROLE_SYSTEM_PREFIXES).map(role => pluginSpec(role, { ...docs, specEnabled }));
+  const mirrorCards = Object.keys(ROLE_SYSTEM_PREFIXES).map(role => pluginSpec(role, docs));
+  const pluginCards = Object.keys(ROLE_SYSTEM_PREFIXES).map(role => pluginSpec(role, { ...docs, specLimits: limits, specEnabled }));
   const pluginSpecs = pluginCards.map(card => {
     const { key, id, kind, title, summary, relPath, bytes, body } = card;
     return { key, id, kind, title, summary, relPath, bytes, materialized: exists(relPath),
@@ -1150,7 +1150,7 @@ export function projectSpecStatus(root, { specId, includeBody = false, repoRoot 
   let pluginMirrorUpToDate = false;
   if (pluginMaterialized) {
     const expected = pluginVersion ? mirrorFiles(root, pluginVersion)
-      : pluginCards.map(card => [path.basename(card.relPath), `${card.body}\n`]);
+      : mirrorCards.map(card => [path.basename(card.relPath), `${card.body}\n`]);
     try { pluginMirrorUpToDate = expected.every(([name, content]) => readFile(path.join(root, MIRROR_ROOT, name)) === content); }
     catch { pluginMirrorUpToDate = false; }
   }

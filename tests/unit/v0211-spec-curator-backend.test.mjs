@@ -5,7 +5,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
 import { buildInitialRosterFromProbe, mergeActivePresets } from "../../core/catalog.mjs";
 import { createOrchestrator } from "../../core/orchestrator.mjs";
-import { assembleSpecPrompt, buildCuratorStaticProbe, pluginSpec, readProjectSpecs } from "../../core/spec-context.mjs";
+import { assembleSpecPrompt, buildCuratorStaticProbe, materializeProjectSpecs, pluginSpec, projectSpecStatus, readProjectSpecs } from "../../core/spec-context.mjs";
 import { git, offlineCatalog, project } from "../helpers/fixtures.mjs";
 import { withProjectSandbox } from "../helpers/sandbox.mjs";
 import { within } from "../helpers/process.mjs";
@@ -515,7 +515,7 @@ specTest("按项目独立设置单篇与总上限（setLimits）：空白仓零�
     assert.match(calls.at(-1).prompt, /正文 <= 4096 B[\s\S]*>= 3277 B/);
     assert.match(calls.at(-1).prompt, /总正文 \d+B \/ 49152B/);
 
-    // 5. 存量总上限放宽至 48KB 后，单次子 Agent 注入包仍严格受 16KiB 护栏保护（超预算选读规范自动降级 summary）
+    // 5. 存量总上限放宽至 48KB 后，单次子 Agent 内联预算直接跟随 totalMaxKb（22KB 全部内联；若上限收紧为 16KB 则超预算选读自动降级 summary）
     for (let i = 1; i <= 6; i++) {
       write(projA, `.agent-tower/spec/02-coding/mod-${i}.md`,
         markdown(`mod-${i}`, `MOD_${i}_` + "y".repeat(3600), 'kind: coding\nrequired: false\ntags: ["bulk_hit"]\n'));
@@ -524,8 +524,13 @@ specTest("按项目独立设置单篇与总上限（setLimits）：空白仓零�
       cwd: projA, repoRoot: projA, inventory: readProjectSpecs(projA), role: "executor",
       rawPrompt: "处理 bulk_hit 相关逻辑", dynamicPrompt: "WORK", specLimits: { singleMaxKb: 4, totalMaxKb: 48 },
     });
-    assert.ok(bundle.full.meta.specBytes <= 18_500 && bundle.full.meta.inlineCount >= 3 && bundle.full.meta.summaryCount >= 2,
-      `存量扩容后单次注入仍受 16KiB 护栏约束: inline=${bundle.full.meta.inlineCount}, summary=${bundle.full.meta.summaryCount}, bytes=${bundle.full.meta.specBytes}`);
+    assert.equal(bundle.full.meta.inlineCount, 6);
+    assert.equal(bundle.full.meta.summaryCount, 0);
+    const capped = assembleSpecPrompt({
+      cwd: projA, repoRoot: projA, inventory: readProjectSpecs(projA), role: "executor",
+      rawPrompt: "处理 bulk_hit 相关逻辑", dynamicPrompt: "WORK", specLimits: { singleMaxKb: 4, totalMaxKb: 16 },
+    });
+    assert.ok(capped.full.meta.specBytes <= 18_500 && capped.full.meta.inlineCount >= 3 && capped.full.meta.summaryCount >= 2);
   } finally { await o.shutdown(); }
 }));
 
@@ -727,6 +732,37 @@ specTest("锁模维护官从 Swarm 黑板结算，驻留成员再派只认新一
     assert.equal((await curate("cancelTicket")).cancelled, true);
     assert.deepEqual(await curate("stopHookCheck"), {});
   } finally { await o.shutdown(); }
+}));
+
+specTest("动态配额全链路贯通：单次内联预算直接跟随 totalMaxKb，且 [插件自带] curator 预览与探针实时显示项目上限而不破坏镜像状态", () => withProjectSandbox("curator-dynamic-budget", dir => {
+  const root = project(dir, "repo");
+  for (let i = 1; i <= 4; i++) {
+    write(root, `${specRoot}/02-coding/big-${i}.md`, markdown(`big-${i}`, "x".repeat(5600), 'kind: coding\nrequired: true\nscopes: ["src/**"]\nsummary: big\n'));
+  }
+  materializeProjectSpecs(root, "0.3.3.2");
+  const inventory = readProjectSpecs(root);
+
+  const underDefault = assembleSpecPrompt({
+    inventory, cwd: root, repoRoot: root, role: "executor", rawPrompt: "edit src/index.js", dynamicPrompt: "WORK",
+    selection: { targetPaths: ["src/index.js"] },
+  });
+  assert.ok(underDefault.full.meta.warnings.some(w => w.code === "REQUIRED_BUDGET_DEGRADED"), "默认 16 KB 下 22 KB 必读规范触发预算降级");
+
+  const raisedLimits = { singleMaxKb: 6, totalMaxKb: 32 };
+  const underRaised = assembleSpecPrompt({
+    inventory, cwd: root, repoRoot: root, role: "executor", rawPrompt: "edit src/index.js", dynamicPrompt: "WORK",
+    selection: { targetPaths: ["src/index.js"] }, specLimits: raisedLimits,
+  });
+  assert.equal(underRaised.full.meta.warnings.filter(w => w.code === "REQUIRED_BUDGET_DEGRADED").length, 0, "调高至 32 KB 后全部必读规范完整内联");
+  assert.equal(underRaised.full.meta.inlineCount, 4);
+
+  const status = projectSpecStatus(root, { version: "0.3.3.2", specLimits: { singleMaxKb: 4, totalMaxKb: 32 }, includeBody: true });
+  assert.equal(status.pluginMirrorUpToDate, true, "动态预览不污染磁盘静态镜像一致性");
+  const curatorCard = status.pluginSpecs.find(s => s.id === "curator");
+  assert.match(curatorCard.body, /<= 4096 B[\s\S]*>= 3277 B/);
+
+  const probe = buildCuratorStaticProbe(root, { specLimits: { singleMaxKb: 4, totalMaxKb: 32 } });
+  assert.match(probe, /单篇上限 4096B，总正文 \d+B \/ 32768B/);
 }));
 
 test("v0.2.11 后端规范维护契约", { concurrency: 8 }, async t => {

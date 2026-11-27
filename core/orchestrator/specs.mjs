@@ -1366,5 +1366,5 @@ export function createSpecsModule(ctx) {
 
   return { listProjectSpecs, initProjectSpecs, projectSpecsSummary, prepareTurn, specCuration, curationStatus,
     assertSpecEnabled, assertCuratorAvailable, isCuratorThread, startCurator, onWorkStarted, onWorkSettled, onHostSettlement, stopAutoCuration,
-    curatorPromptContext, issueNativeCuration, admitNativeCuration, claimNativeCuration, observeNativeCuration, scheduleAuto };
+    projectSpecLimits, curatorPromptContext, issueNativeCuration, admitNativeCuration, claimNativeCuration, observeNativeCuration, scheduleAuto };
 }

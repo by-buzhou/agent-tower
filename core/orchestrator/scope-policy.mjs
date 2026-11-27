@@ -454,7 +454,8 @@ export function createScopePolicyModule(ctx) {
     const specs = assembleSpecPrompt({ inventory, cwd: checkout, repoRoot, role, rawPrompt,
       dynamicPrompt: [ticket?.reviewFilesBlock, planWarning].filter(Boolean).join("\n\n"), selection, planDoc,
       review: ticket?.reviewSpec, specEnabled, controlDir: ctx.dataDir,
-      ...(role === "curator" && specEnabled ? ctx.specs.curatorPromptContext(repoRoot, root) : {}) });
+      specLimits: specEnabled ? (ctx.specs?.projectSpecLimits?.(repoRoot) ?? ctx.db.getProjectSpec?.(repoRoot)) : undefined,
+      ...(role === "curator" && specEnabled ? ctx.specs?.curatorPromptContext?.(repoRoot, root) : {}) });
     const planKey = specs.full.meta.items.find(item => item.kind === "plan")?.key;
     const budgetWarning = specs.full.meta.warnings.find(({ key }) => key === planKey);
     const playbookInject = [specs.full.prompt.trim(), budgetWarning && `【规划投递告警】${budgetWarning.code}：${singleLine(budgetWarning.message)}`]
