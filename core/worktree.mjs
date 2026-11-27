@@ -437,7 +437,10 @@ export async function createIsolatedWorktree({
   const sourceDir = workspace || cwd || process.cwd();
   const repoRoot = await getRepoRoot(sourceDir);
   if (!repoRoot) {
-    throw new Error(`无法创建 Git Worktree：当前目录不是有效的 Git 仓库 (${sourceDir})`);
+    throw Object.assign(
+      new Error(`无法创建 Git Worktree：当前目录不是有效的 Git 仓库 (${sourceDir})`),
+      { code: "WORKTREE_CREATE_FAILED" },
+    );
   }
 
   // Ensure the repository has at least one commit
@@ -446,7 +449,10 @@ export async function createIsolatedWorktree({
     const rev = await runGit(["rev-parse", "--verify", `${baseRef}^{commit}`], { cwd: repoRoot });
     baseSha = rev.stdout.trim();
   } catch {
-    throw new Error(`无法创建 Git Worktree：基准引用 "${baseRef}" 无效或仓库尚无初始 Commit。`);
+    throw Object.assign(
+      new Error(`无法创建 Git Worktree：基准引用 "${baseRef}" 无效或仓库尚无初始 Commit。`),
+      { code: "WORKTREE_CREATE_FAILED" },
+    );
   }
 
   await pruneStaleWorktrees(repoRoot);
@@ -471,12 +477,19 @@ export async function createIsolatedWorktree({
 
   const createOptions = { cwd: repoRoot, timeoutMs: 60000 };
   try {
-    await runGit(["worktree", "add", "-b", finalBranch, worktreePath, baseSha], createOptions);
+    try {
+      await runGit(["worktree", "add", "-b", finalBranch, worktreePath, baseSha], createOptions);
+    } catch (error) {
+      if (process.platform !== "win32" || !/\$GIT_DIR['"]? too big/.test(error.stderr)) throw error;
+      // Git has created the branch. A shorter folder also shortens the Git administrative path used by remove.
+      worktreePath = normalizeFsPath(path.join(rootBase, crypto.randomBytes(4).toString("hex")));
+      await runGit(["worktree", "add", worktreePath, finalBranch], createOptions);
+    }
   } catch (error) {
-    if (process.platform !== "win32" || !/\$GIT_DIR['"]? too big/.test(error.stderr)) throw error;
-    // Git has created the branch. A shorter folder also shortens the Git administrative path used by remove.
-    worktreePath = normalizeFsPath(path.join(rootBase, crypto.randomBytes(4).toString("hex")));
-    await runGit(["worktree", "add", worktreePath, finalBranch], createOptions);
+    throw Object.assign(
+      new Error(`无法创建 Git Worktree：${error?.message || String(error)}`, { cause: error }),
+      { code: "WORKTREE_CREATE_FAILED", stdout: error?.stdout || "", stderr: error?.stderr || "" },
+    );
   }
 
   // Honor `.worktreeinclude` if present in repoRoot (AgentTower compatibility)

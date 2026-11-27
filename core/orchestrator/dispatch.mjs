@@ -333,6 +333,19 @@ export function createDispatchModule(ctx) {
       () => delegateTaskCore({ ...params, role: "curator", _skipInferConversation: true }, undefined, { source, beforeStart }));
   }
 
+  async function createRequiredWorktree(options) {
+    try {
+      return await createIsolatedWorktree(options);
+    } catch (wtErr) {
+      const rawMessage = wtErr?.message || String(wtErr);
+      const suffix = "（已拒绝退回原工作目录执行）";
+      const message = rawMessage.endsWith(suffix) ? rawMessage : `${rawMessage}${suffix}`;
+      throw Object.assign(new Error(message, { cause: wtErr }), {
+        code: typeof wtErr?.code === "string" && wtErr.code ? wtErr.code : "WORKTREE_CREATE_FAILED",
+      });
+    }
+  }
+
   async function delegateTaskCore(params = {}, claim, curation) {
     const rawTask = String(params.task ?? params.prompt ?? params.message ?? "").trim();
     if (!rawTask) {
@@ -387,32 +400,18 @@ export function createDispatchModule(ctx) {
     const taskId = claim?.taskId || params.taskId || makeId("task");
     const title = params.title ? String(params.title).trim() : summarizeTitle(rawTask, "Delegated Subagent");
 
-    const explicitWorktreeRequested =
-      params.isolation === "worktree" ||
-      params.target?.isolation === "worktree" ||
-      params.workspaceStrategy?.type === "worktree";
-
     let effectiveIsolation = resolved.isolation;
-    let worktreeFallbackReason = null;
     let worktreeInfo = null;
     if (effectiveIsolation === "worktree") {
-      try {
-        threadId ||= makeId("thr");
-        worktreeInfo = await createIsolatedWorktree({
-          cwd: baseWorkspace,
-          workspace: repoRoot,
-          threadId,
-          taskSlug: title,
-          branch: params.branch,
-          baseRef: params.baseRef || "HEAD",
-        });
-      } catch (wtErr) {
-        if (explicitWorktreeRequested) {
-          throw wtErr;
-        }
-        effectiveIsolation = "local";
-        worktreeFallbackReason = wtErr?.message || String(wtErr);
-      }
+      threadId ||= makeId("thr");
+      worktreeInfo = await createRequiredWorktree({
+        cwd: baseWorkspace,
+        workspace: repoRoot,
+        threadId,
+        taskSlug: title,
+        branch: params.branch || params.workspaceStrategy?.branch,
+        baseRef: params.baseRef || params.workspaceStrategy?.baseRef || "HEAD",
+      });
     }
 
     const afterWorktreeBypass = !curation && ctx.scopePolicy.dispatchBypass(params);
@@ -451,16 +450,11 @@ export function createDispatchModule(ctx) {
       }
       if (effectiveIsolation === "worktree" && !worktreeInfo) {
         threadId ||= makeId("thr");
-        try {
-          worktreeInfo = await createIsolatedWorktree({
-            cwd: baseWorkspace, workspace: repoRoot, threadId, taskSlug: title,
-            branch: params.branch, baseRef: params.baseRef || "HEAD",
-          });
-        } catch (wtErr) {
-          if (explicitWorktreeRequested) throw wtErr;
-          effectiveIsolation = "local";
-          worktreeFallbackReason = wtErr?.message || String(wtErr);
-        }
+        worktreeInfo = await createRequiredWorktree({
+          cwd: baseWorkspace, workspace: repoRoot, threadId, taskSlug: title,
+          branch: params.branch || params.workspaceStrategy?.branch,
+          baseRef: params.baseRef || params.workspaceStrategy?.baseRef || "HEAD",
+        });
       }
     } catch (error) {
       if (worktreeInfo?.worktreePath) await cleanupWorktree({ worktreePath: worktreeInfo.worktreePath, repoRoot, force: true }).catch(() => {});
@@ -530,7 +524,6 @@ export function createDispatchModule(ctx) {
         ...(isDisposableThread ? { ephemeral: true } : {}),
         externalSessionVisible: !hideExternalSession,
         ...(rootConversationId ? { rootConversationId } : {}),
-        ...(worktreeFallbackReason ? { worktreeFallbackReason } : {}),
         ...(worktreeInfo?.baseSha || worktreeInfo?.headSha ? { baseSha: worktreeInfo.baseSha || worktreeInfo.headSha } : {}),
         ...resolved.routing,
         orchestrationMode,
@@ -835,31 +828,17 @@ export function createDispatchModule(ctx) {
         ? summarizeTitle(initialMessage, "New Session")
         : "New Session";
 
-    const explicitWorktreeRequested =
-      params.isolation === "worktree" ||
-      params.target?.isolation === "worktree" ||
-      params.workspaceStrategy?.type === "worktree";
-
     let effectiveIsolation = resolved.isolation;
-    let worktreeFallbackReason = null;
     let worktreeInfo = null;
     if (effectiveIsolation === "worktree") {
-      try {
-        worktreeInfo = await createIsolatedWorktree({
-          cwd: baseWorkspace,
-          workspace: repoRoot,
-          threadId,
-          taskSlug: title,
-          branch: params.branch || params.workspaceStrategy?.branch,
-          baseRef: params.baseRef || params.workspaceStrategy?.baseRef || "HEAD",
-        });
-      } catch (wtErr) {
-        if (explicitWorktreeRequested) {
-          throw wtErr;
-        }
-        effectiveIsolation = "local";
-        worktreeFallbackReason = wtErr?.message || String(wtErr);
-      }
+      worktreeInfo = await createRequiredWorktree({
+        cwd: baseWorkspace,
+        workspace: repoRoot,
+        threadId,
+        taskSlug: title,
+        branch: params.branch || params.workspaceStrategy?.branch,
+        baseRef: params.baseRef || params.workspaceStrategy?.baseRef || "HEAD",
+      });
     }
 
     const afterWorktreeBypass = ctx.scopePolicy.dispatchBypass(params);
@@ -898,17 +877,11 @@ export function createDispatchModule(ctx) {
         effectiveIsolation = resolved.isolation;
       }
       if (effectiveIsolation === "worktree" && !worktreeInfo) {
-        try {
-          worktreeInfo = await createIsolatedWorktree({
-            cwd: baseWorkspace, workspace: repoRoot, threadId, taskSlug: title,
-            branch: params.branch || params.workspaceStrategy?.branch,
-            baseRef: params.baseRef || params.workspaceStrategy?.baseRef || "HEAD",
-          });
-        } catch (wtErr) {
-          if (explicitWorktreeRequested) throw wtErr;
-          effectiveIsolation = "local";
-          worktreeFallbackReason = wtErr?.message || String(wtErr);
-        }
+        worktreeInfo = await createRequiredWorktree({
+          cwd: baseWorkspace, workspace: repoRoot, threadId, taskSlug: title,
+          branch: params.branch || params.workspaceStrategy?.branch,
+          baseRef: params.baseRef || params.workspaceStrategy?.baseRef || "HEAD",
+        });
       }
     } catch (error) {
       if (worktreeInfo?.worktreePath) await cleanupWorktree({ worktreePath: worktreeInfo.worktreePath, repoRoot, force: true }).catch(() => {});
@@ -959,7 +932,6 @@ export function createDispatchModule(ctx) {
         ...(isDisposableThread ? { ephemeral: true } : {}),
         externalSessionVisible: !hideExternalSession,
         ...(launchRootConvId ? { rootConversationId: launchRootConvId } : {}),
-        ...(worktreeFallbackReason ? { worktreeFallbackReason } : {}),
         ...(worktreeInfo?.baseSha || worktreeInfo?.headSha ? { baseSha: worktreeInfo.baseSha || worktreeInfo.headSha } : {}),
         ...resolved.routing,
         orchestrationMode,

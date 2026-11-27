@@ -363,6 +363,37 @@ test('Worktree 运行中拒绝合入/清理，清理后线程回退主仓', () =
   assert.equal(after.meta.worktreeCleaned, true);
 }));
 
+test('预设继承或显式 Worktree 创建失败时严禁静默降级回原目录执行', () => fixture('v3-worktree-fail-closed', async (o, ctx, dir) => {
+  let turns = 0;
+  o.engineManager.runTurn = () => { turns++; return deferredHandle(); };
+  await o.saveSettings({
+    workspace: ctx.cwd,
+    presets: { executor_codex: { ...DEFAULT_ROLE_PRESETS.executor_codex, isolation: 'worktree' } },
+  });
+  await assert.rejects(
+    o.delegateTask({ ...ctx, task: 'inherit-preset-bad-ref', baseRef: 'refs/heads/nonexistent' }),
+    err => err?.code === 'WORKTREE_CREATE_FAILED' && /已拒绝退回原工作目录执行/.test(err.message),
+  );
+  await assert.rejects(
+    o.launchThread({ ...ctx, message: 'launch-preset-bad-ref', baseRef: 'refs/heads/nonexistent' }),
+    err => err?.code === 'WORKTREE_CREATE_FAILED' && /已拒绝退回原工作目录执行/.test(err.message),
+  );
+  const plainDir = path.join(dir, 'plain-no-git');
+  fs.mkdirSync(plainDir, { recursive: true });
+  await o.saveSettings({
+    workspace: plainDir,
+    defaultOrchestrationMode: 'complex',
+    presets: { executor_codex: { ...DEFAULT_ROLE_PRESETS.executor_codex, isolation: 'worktree' } },
+  });
+  await assert.rejects(
+    o.delegateTask({ cwd: plainDir, conversationId: 'root-plain', presetKey: 'executor_codex', task: 'plain-dir-must-fail' }),
+    err => err?.code === 'WORKTREE_CREATE_FAILED' && /不是有效的 Git 仓库/.test(err.message) && /已拒绝退回原工作目录执行/.test(err.message),
+  );
+  assert.equal(turns, 0);
+  assert.equal(o.db.listThreads().length, 0);
+  assert.equal(o.db.listRuns().length, 0);
+}));
+
 
 test('显式路径校验无部分派发；控制面真实路径也拒绝', () => fixture('v3-root-fail-closed', async (o, ctx, dir) => {
   const bad = path.join(dir, 'missing');
