@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  AGENT_TOWER_DISABLE_UPDATE_CHECK: '1'
+
+jobs:
+  verify:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Syntax and architecture check
+        run: npm run check
+      - name: Repository pre-mount stage check
+        shell: pwsh
+        run: |
+          $env:AGENT_TOWER_VALIDATE_STAGE_IN_REPO = '1'
+          node scripts/publish-plugin.mjs --stage-only
+      - name: Fast unit test suite
+        run: npm run test:fast
+      - name: Release bundle smoke build
+        run: npm run build:release -- --out-dir "${{ runner.temp }}/at-release-smoke"
+
+  unicode-space-path:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Verify check, stage-only and fast tests in Unicode + space path
+        shell: pwsh
+        run: |
+          $dest = Join-Path "${{ runner.temp }}" "AgentTower 中文 路径\repo"
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          Get-ChildItem -Force -LiteralPath (Get-Location).Path | Where-Object { $_.Name -ne '.git' } | ForEach-Object {
+            Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $dest $_.Name) -Recurse -Force
+          }
+          Push-Location -LiteralPath $dest
+          try {
+            npm run check
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $env:AGENT_TOWER_VALIDATE_STAGE_IN_REPO = '1'
+            node scripts/publish-plugin.mjs --stage-only
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            npm run test:fast
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } finally {
+            Pop-Location
+          }

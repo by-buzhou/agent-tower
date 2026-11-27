@@ -1,0 +1,1022 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark" data-theme-mode="auto">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AgentTower v__STUDIO_VERSION__</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <meta name="agent-tower-asset-hash" content="__AGENT_TOWER_ASSET_HASH__" />
+  <link rel="stylesheet" media="print" onload="this.media='all'" href="https://fonts.googleapis.com/css2?family=Google+Sans+Flex:ROND,opsz,slnt,wdth,wght@0..100,6..144,-10..0,92..100,100..1000&family=Google+Sans+Code:ital,wght@0,300..800;1,300..800&display=swap" />
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <div id="studio-app" class="studio-app" data-view="board">
+    <!-- ================================================================
+         1. 对齐官方 swarm_board 的两行极简顶栏（单会话严格独立隔离）
+         ================================================================ -->
+    <header id="studio-header" class="sw-header">
+      <!-- 第 1 行：当前对话标题 + 实时指示 + 极简控制动作 -->
+      <div class="sw-header-row">
+        <div class="swarm-heading-group" id="swarm-heading-group">
+          <h1 id="swarm-title" class="swarm-title" title="当前独立对话协作看板">AgentTower</h1>
+          <span id="swarm-subtitle" class="swarm-subtitle" hidden></span>
+        </div>
+        <select id="standalone-conv-select" class="standalone-conv-select" hidden aria-label="独立浏览器切换对话"></select>
+
+        <span class="sw-live" id="conn-live-badge" role="status" title="实时同步连接状态">
+          <span class="sw-live-dot" id="conn-status-dot" aria-hidden="true"></span>
+          <span class="sw-live-label" id="conn-status-label">就绪</span>
+        </span>
+
+        <div class="header-right-actions">
+          <button type="button" id="topbar-update-badge" class="hdr-chip-btn update-badge" hidden title="查看新版本与更新说明" aria-label="发现新版本，点击查看更新说明">⬆ 新版</button>
+          <div class="telemetry-token-wrap">
+            <button type="button" id="btn-token-breakdown" class="hdr-chip-btn" title="查看当前会话遥测与 Token 明细">
+              <span class="num" id="hdr-telemetry-brief">0 运行 · 0 Tok</span>
+            </button>
+            <div id="token-popover" class="token-popover" hidden>
+              <div class="popover-title" id="popover-scope-title">当前会话遥测明细</div>
+              <div class="token-detail-row"><span>活跃运行中</span><strong id="stat-running-count" class="num">0</strong></div>
+              <div class="token-detail-row"><span>待人工介入</span><strong id="stat-pending-count" class="num">0</strong></div>
+              <div class="token-detail-row"><span>已完结任务</span><strong id="stat-completed-count" class="num">0</strong></div>
+              <div class="token-detail-row total"><span>输入 Token</span><strong id="tok-input" class="num">0</strong></div>
+              <div class="token-detail-row"><span>缓存命中</span><strong id="tok-cached" class="num">0</strong></div>
+              <div class="token-detail-row"><span>思考推理</span><strong id="tok-reasoning" class="num">0</strong></div>
+              <div class="token-detail-row"><span>输出 Token</span><strong id="tok-output" class="num">0</strong></div>
+              <div class="token-detail-row total"><span>总计消耗</span><strong id="tok-total" class="num">0</strong></div>
+              <div id="studio-url-box" class="studio-url-box" hidden>
+                <span class="url-label">独立浏览器地址</span>
+                <button type="button" id="btn-copy-studio-url" class="link-action-btn">复制链接</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- v0.1.1 原位三档编排模式胶囊（保留旧派发开关 ID 兼容既有选择器），点击展开右对齐单列浮层；宽屏改显完整模式名 -->
+          <button type="button" id="btn-conv-dispatch-toggle" class="hdr-chip-btn mode-pill mode-direct dispatch-off" aria-haspopup="menu" aria-expanded="false" aria-controls="conv-mode-popover" data-long-label="直出▾" title="当前对话编排模式：直出（子 Agent 派发已关闭）· 点击切换">
+            <span id="conv-dispatch-icon" aria-hidden="true">⚡</span>
+            <span id="conv-dispatch-text">直出▾</span>
+          </button>
+          <div id="conv-mode-popover" class="mode-popover" role="menu" aria-label="当前对话编排模式" hidden></div>
+
+
+          <button type="button" id="btn-theme-toggle" class="sw-icon-btn" title="切换亮色 / 暗色主题（配置页可改回跟随宿主）" aria-label="切换亮色 / 暗色主题">
+            <span id="theme-toggle-icon">◐</span>
+          </button>
+          <button type="button" id="btn-refresh-all" class="sw-icon-btn" title="同步当前会话最新状态" aria-label="刷新">↻</button>
+          <button type="button" id="btn-open-dispatch" class="hdr-primary-btn">+ 派发</button>
+        </div>
+      </div>
+
+      <!-- 第 2 行：平级 5 大主导航 Tab（看板 / 成员 / 变更 / 项目配置 / 全局配置） -->
+      <nav class="sw-tabs" id="main-view-tabs" role="tablist" aria-label="工作台视图切换">
+        <button type="button" role="tab" aria-selected="true" class="sw-tab active" data-view="board">
+          <span>看板</span>
+          <span id="tab-badge-board" class="sw-tab-count num" hidden>0</span>
+        </button>
+        <button type="button" role="tab" aria-selected="false" class="sw-tab" data-view="members">
+          <span>成员</span>
+          <span id="tab-badge-members" class="sw-tab-count num" hidden>0</span>
+        </button>
+        <button type="button" role="tab" aria-selected="false" class="sw-tab" data-view="diff">
+          <span>变更</span>
+          <span id="tab-badge-diff" class="sw-tab-count num" hidden>0</span>
+        </button>
+        <button type="button" role="tab" aria-selected="false" class="sw-tab" data-view="settings">
+          <span>项目配置</span>
+          <span id="tab-dot-project-dispatch" class="sw-tab-dot" hidden aria-hidden="true"></span>
+        </button>
+        <button type="button" role="tab" aria-selected="false" class="sw-tab" data-view="global">
+          <span>全局配置</span>
+          <span id="tab-badge-extensions" class="sw-tab-count num" hidden>0</span>
+        </button>
+      </nav>
+    </header>
+
+    <!-- ================================================================
+         2. 居中单流主舞台（告别左右挤压）
+         ================================================================ -->
+    <main id="studio-main" class="sw-main">
+      <!-- 本对话子 Agent 派发已停用状态横幅 & 运行中一键中断入口 -->
+      <div id="dispatch-paused-strip" class="dispatch-paused-strip" hidden></div>
+
+      <!-- 看门狗自愈与异常告警横幅（仅属于当前对话 open 状态的告警） -->
+      <div id="watchdog-incidents-banner" class="watchdog-incidents-banner" hidden></div>
+
+      <!-- 置顶全局待审批/多选提问告警区（仅属于当前对话的待处理请求） -->
+      <div id="global-requests-banner" class="global-requests-banner" hidden></div>
+
+      <!-- Tab 1: 看板 -->
+      <section id="view-board" class="sw-tab-body active" role="tabpanel" aria-label="看板流">
+        <!-- 安静的零协作引导页（对齐官方 swarm_board .empty-card，仅当当前对话暂无协作数据时展示） -->
+        <div id="board-empty-state" class="empty-state" hidden>
+          <div class="empty-card">
+            <svg class="empty-icon" width="56" height="56" viewBox="0 0 96 96" aria-hidden="true">
+              <g class="links">
+                <line x1="48" y1="26" x2="25" y2="66" />
+                <line x1="48" y1="26" x2="71" y2="66" />
+                <line x1="25" y1="66" x2="71" y2="66" />
+              </g>
+              <circle class="node" cx="48" cy="26" r="9" />
+              <circle class="node" cx="25" cy="66" r="8" />
+              <circle class="node" cx="71" cy="66" r="8" />
+            </svg>
+            <h2 class="empty-title">当前对话暂无子 Agent 协作任务</h2>
+            <p class="empty-body">当在本对话通过原生 Swarm 或外部引擎委派子任务后，全部进展、成员关系与隔离 Diff 将在此独立呈现。</p>
+            <div class="empty-actions">
+              <button type="button" id="btn-empty-council" class="quick-pill-btn">🧠 召唤军师团评方案</button>
+              <button type="button" id="btn-empty-dispatch" class="hdr-primary-btn">+ 派发子任务</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- 吸顶清爽工具栏 -->
+        <div class="board-toolbar" id="board-toolbar">
+          <div class="board-search-row">
+            <label class="sw-search">
+              <svg class="sw-icon" width="14" height="14" viewBox="0 0 16 16" aria-hidden="true">
+                <circle cx="7" cy="7" r="4.25" fill="none" stroke="currentColor" stroke-width="1.5"/>
+                <path d="m10.25 10.25 3.25 3.25" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+              </svg>
+              <input id="board-search-input" type="search" placeholder="搜索当前对话的发言、模型、代码或工具..." autocomplete="off" />
+            </label>
+            <button type="button" id="btn-board-filter-toggle" class="sw-icon-btn filter-toggle" aria-expanded="false" aria-controls="board-filters-panel" title="筛选成员发言与自动跟随">
+              <svg class="sw-icon" width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
+                <path d="M2.5 4.5h11M4.5 8h7M6.5 11.5h3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+              </svg>
+              <span id="board-filter-dot" class="filter-dot" hidden></span>
+            </button>
+            <div class="quick-launch-pills">
+              <button type="button" id="btn-summon-council" class="quick-pill-btn" title="并发评方案：军师组全部已启用成员独立盲评">🧠 军师团</button>
+              <button type="button" id="btn-astra-review" class="quick-pill-btn" title="终审官检查改动、直接修复并自测">🔍 终审</button>
+              <button type="button" id="btn-board-dispatch" class="quick-pill-btn">+ 派发</button>
+            </div>
+          </div>
+
+          <!-- v0.2.10.2 看板按需窗口：发言计数 + 20 / 50 / 全部 档位 -->
+          <div class="board-window-bar">
+            <span id="board-window-summary" class="sub-note"></span>
+            <div id="board-page-size" class="board-page-size" role="group" aria-label="看板默认展示条数">
+              <button type="button" class="mini-filter-pill active" data-board-limit="20" aria-pressed="true">20</button>
+              <button type="button" class="mini-filter-pill" data-board-limit="50" aria-pressed="false">50</button>
+              <button type="button" class="mini-filter-pill" data-board-limit="all" aria-pressed="false">全部</button>
+            </div>
+          </div>
+
+          <!-- 展开的漏斗筛选面板（成员胶囊 + Follow 自动滚底开关） -->
+          <div id="board-filters-panel" class="board-filters-panel" hidden>
+            <div class="filters-top-row">
+              <span class="filters-lbl">按成员筛选：</span>
+              <div class="filters-right-controls">
+                <label class="sw-switch" title="自动滚动到底部最新进展">
+                  <input type="checkbox" id="chk-board-follow" checked />
+                  <span class="sw-switch-track" aria-hidden="true"></span>
+                  <span>Follow</span>
+                </label>
+                <button type="button" id="btn-board-clear-filters" class="ghost-xs-btn">清空筛选</button>
+              </div>
+            </div>
+            <div id="board-member-chips" class="board-member-chips" role="group" aria-label="成员筛选胶囊"></div>
+          </div>
+        </div>
+
+        <!-- 看板主消息流 (#1, #2, #3...) -->
+        <div id="board-feed" class="board-feed" aria-live="polite"></div>
+
+        <button type="button" id="btn-jump-latest" class="jump-latest-pill" hidden>↓ 最新</button>
+
+        <!-- 宽屏（≥ 1120px）右侧 300px 吸顶实时状态边栏；窄栏由 CSS 隐藏 -->
+        <aside id="board-side-rail" class="board-side-rail" aria-label="实时状态边栏"></aside>
+      </section>
+
+      <!-- Tab 2: 成员 -->
+      <section id="view-members" class="sw-tab-body" role="tabpanel" hidden aria-label="成员花名册">
+        <div class="members-toolbar">
+          <div class="members-summary-line">
+            <span id="members-count-summary">当前对话共 0 位成员</span>
+            <button type="button" id="btn-archive-idle-members" class="ghost-xs-btn" hidden>🧹 归档闲置分身</button>
+          </div>
+          <div class="members-filter-chips" id="members-status-filter">
+            <button type="button" class="mini-filter-pill active" data-mstatus="all">全部</button>
+            <button type="button" class="mini-filter-pill" data-mstatus="active">工作中/待介入</button>
+            <button type="button" class="mini-filter-pill" data-mstatus="completed">已完结</button>
+          </div>
+        </div>
+        <div id="spec-curation-reminder" class="spec-curation-reminder" hidden></div>
+        <div id="members-roster-list" class="members-roster-list" role="list"></div>
+      </section>
+
+      <!-- Tab 3: 变更 -->
+      <section id="view-diff" class="sw-tab-body" role="tabpanel" hidden aria-label="Worktree 与代码变更">
+        <div class="diff-view-shell">
+          <div class="diff-wt-bar">
+            <div class="diff-wt-select-wrap">
+              <span class="wt-bar-lbl">隔离分支：</span>
+              <select id="wt-select-dropdown" class="compact-select" aria-label="选择当前对话的隔离 Worktree"></select>
+              <button type="button" id="btn-refresh-worktrees" class="ghost-xs-btn">↻ 刷新</button>
+            </div>
+            <div id="wt-action-bar" class="wt-action-bar" hidden>
+              <select id="wt-diff-mode-select" class="compact-select" title="Diff 对比范围">
+                <option value="working_tree">工作树未提交 + 分支改动</option>
+                <option value="branch_range">相对基点提交差异</option>
+              </select>
+              <button type="button" id="btn-wt-apply" class="hdr-primary-btn">应用补丁到主工作区</button>
+              <button type="button" id="btn-wt-squash" class="ghost-xs-btn">Squash 合并</button>
+              <button type="button" id="btn-wt-review" class="ghost-xs-btn">Astra 终审此分支</button>
+              <button type="button" id="btn-wt-cleanup" class="ghost-xs-btn danger-txt">安全清理 Worktree</button>
+            </div>
+          </div>
+          <div id="wt-meta-strip" class="wt-meta-strip" hidden></div>
+          <div id="wt-changed-files" class="wt-changed-files" hidden></div>
+          <div id="wt-diff-viewer" class="wt-diff-viewer">
+            <div class="empty-stage-box">当前对话暂无隔离 Git Worktree 变更。派发任务选择「独立 Worktree」后可在此审查 Diff 并一键合并。</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Tab 4: 项目配置（3 个子页面卡片：成员与阵容 / 项目规范 / 会话与缓存；严禁 role=tab 与 data-view） -->
+      <section id="view-settings" class="sw-tab-body" role="tabpanel" hidden aria-label="项目配置">
+        <div class="settings-stack">
+          <div class="set-context-strip">
+            <span class="set-context-lbl">当前作用项目</span>
+            <span id="settings-scope-project-name" class="set-scope-badge is-unbound" title="当前对话未绑定项目目录">未绑定项目</span>
+            <div id="preset-save-status" class="save-pill" data-state="idle" title="修改即时自动保存">
+              <span class="save-pill-dot" aria-hidden="true"></span>
+              <span id="preset-save-text" class="save-pill-text" role="status" aria-live="polite">自动保存</span>
+              <button type="button" id="btn-save-presets" class="save-pill-retry" hidden>重试</button>
+            </div>
+          </div>
+          <div class="set-subnav-bar">
+            <div class="set-subnav subpage-switcher subpage-switcher--3" id="settings-subnav" role="group" aria-label="项目配置子页面">
+              <button type="button" class="set-subtab" aria-pressed="true" data-settings-pane="roles" data-pane-scope="project" aria-controls="settings-pane-roles">成员与阵容</button>
+              <button type="button" class="set-subtab" aria-pressed="false" data-settings-pane="project" data-pane-scope="project" aria-controls="settings-pane-project" tabindex="-1">项目规范</button>
+              <button type="button" class="set-subtab" aria-pressed="false" data-settings-pane="cache" data-pane-scope="project" aria-controls="settings-pane-cache" tabindex="-1">会话与缓存<span id="settings-general-dot" class="set-subtab-dot" role="img" aria-label="当前对话派发已关闭" hidden></span></button>
+            </div>
+          </div>
+
+          <!-- 【项目配置】子页 1：项目独立成员池与分模式阵容 -->
+          <div id="settings-pane-roles" class="set-pane" data-pane="roles">
+            <div class="set-pane-head">
+              <div class="set-pane-titles">
+                <h2 class="set-title">成员池与角色路由 <span id="project-roster-source-badge" class="set-source-badge is-unbound" role="status">未绑定项目</span></h2>
+              </div>
+              <div class="set-head-actions roster-template-actions">
+                <button type="button" id="btn-sync-roster-to-global" class="ghost-xs-btn" title="将当前项目的成员池与模式阵容同步为全局默认模板，供之后新项目继承（不含项目规范开关与配额，不影响其他已独立配置的项目）">⬆ 同步为全局默认配置</button>
+                <button type="button" id="btn-reset-roster-to-global" class="ghost-xs-btn" title="丢弃当前项目的独立成员池，恢复为当前全局默认模板">↺ 恢复为全局默认</button>
+                <button type="button" id="btn-reset-presets" class="set-text-btn" hidden>恢复全部默认</button>
+              </div>
+            </div>
+            <div id="role-presets-grid" class="role-groups"></div>
+          </div>
+
+          <!-- 【项目配置】子页 2：可插拔项目规范（Spec）与专职维护官提案 -->
+          <div id="settings-pane-project" class="set-pane" data-pane="project" hidden>
+            <!-- v0.3.0 可插拔项目规范（Spec）：总开关 + 只读清单 + 单条只读预览 + 双向手动归档（不做在线编辑器；未初始化时零磁盘写入） -->
+            <section class="set-section project-specs-section" id="project-specs-section" aria-labelledby="set-specs-title">
+              <div class="set-section-head">
+                <div class="set-pane-titles">
+                  <h2 class="set-title" id="set-specs-title">项目规范（Spec）</h2>
+                </div>
+                <div class="set-head-actions ps-curation-head">
+                  <span class="ps-curation-auto ps-enable-toggle">
+                    <span class="ps-curation-auto-lbl" id="lbl-project-spec-enabled">接入项目规范</span>
+                    <button type="button" id="btn-project-spec-enabled" class="set-switch ps-curation-switch" role="switch" aria-checked="true" aria-labelledby="lbl-project-spec-enabled" data-fk="spec:enabled" title="本项目已接入项目规范（点击停用）">
+                      <span class="set-switch-track" aria-hidden="true"><span class="set-switch-thumb"></span></span>
+                    </button>
+                  </span>
+                  <span class="ps-curation-auto" id="spec-curation-auto-wrap">
+                    <span class="ps-curation-auto-lbl" id="lbl-spec-curation-auto">自动维护</span>
+                    <button type="button" id="btn-spec-curation-auto" class="set-switch ps-curation-switch" role="switch" aria-checked="false" aria-labelledby="lbl-spec-curation-auto" data-fk="curation:auto" title="本项目自动维护已关闭（点击开启）">
+                      <span class="set-switch-track" aria-hidden="true"><span class="set-switch-thumb"></span></span>
+                    </button>
+                  </span>
+                  <button type="button" id="btn-spec-curation-trigger" class="ghost-xs-btn is-accent" aria-expanded="false" title="由专职规范维护官只读梳理本项目拍板结论并提案（直出 / 简单 / 复杂模式均可用；确认前零写盘）">✨ 维护规范</button>
+                  <button type="button" id="btn-sync-plugin-spec-templates" class="ghost-xs-btn" title="将最新插件角色底线模板同步写入本项目 .agent-tower/spec/00-plugin/；已有项目业务与编码规范保留不动">同步 00-plugin/ 镜像</button>
+                  <button type="button" id="btn-refresh-project-specs" class="ghost-xs-btn" title="重新读取项目规范" aria-label="重新读取项目规范">↻</button>
+                  <button type="button" id="btn-init-project-specs" class="ghost-xs-btn is-accent" title="在 .agent-tower/spec/ 下创建业务 / 编码示例骨架并同步插件角色底线镜像；已有文件一律保留不覆盖" hidden>初始化示例骨架</button>
+                </div>
+              </div>
+              <!-- 停用说明横幅 + 双向手动归档 / 恢复（.agent-tower/spec-archive/，均二次确认；切换总开关本身绝不搬动文件） -->
+              <div class="ps-state-row" id="project-specs-state-row" hidden>
+                <p class="ps-disabled-banner" id="project-specs-disabled-banner" role="status" hidden>本项目未启用项目规范（零读写 .agent-tower/spec/，不干扰项目自有规则体系）</p>
+                <p class="ps-archive-hint" id="project-specs-archive-hint" role="status" hidden></p>
+                <div class="ps-archive-actions">
+                  <button type="button" id="btn-archive-project-specs" class="ghost-xs-btn" title="将 01-business/、02-coding/ 与 INDEX.md 移入 .agent-tower/spec-archive/（可随 Git 提交，可随时恢复）并停用本项目规范" hidden>归档规范</button>
+                  <button type="button" id="btn-restore-project-specs" class="ghost-xs-btn" title="将 .agent-tower/spec-archive/ 中的规范移回 .agent-tower/spec/（保持当前开关状态）" hidden>恢复归档</button>
+                  <button type="button" id="btn-restore-enable-project-specs" class="ghost-xs-btn is-accent" title="恢复归档并重新接入本项目规范" hidden>恢复并开启</button>
+                </div>
+              </div>
+              <!-- v0.2.11 规范维护：手动触发工具条 / 梳理状态 / 整组提案确认卡（单行输入一律 input[type=text]，本区严禁 textarea） -->
+              <div class="ps-curation" id="spec-curation-panel" hidden></div>
+              <div class="set-group">
+                <div class="set-row ps-row">
+                  <div class="set-row-main">
+                    <div class="rc-summary" id="project-specs-summary" role="status" aria-live="polite">项目规范 读取中…</div>
+                  </div>
+                  <div class="ps-quota-bar" id="project-specs-quota-bar">
+                    <span class="ps-quota-used num" id="spec-quota-used" hidden></span>
+                    <label class="ps-quota-field" for="inp-spec-single-kb" title="本项目单篇规范正文上限（1～8 KB，默认 2 KB；仅管仓库存量，按项目独立保存）">
+                      <span>单篇上限</span>
+                      <input type="number" id="inp-spec-single-kb" class="text-input ps-quota-input num" data-spec-limit="single" data-fk="curation:limit-single" min="1" max="8" step="1" value="2" inputmode="numeric" aria-label="本项目单篇规范上限（KB）" />
+                      <span class="ps-quota-unit">KB</span>
+                    </label>
+                    <label class="ps-quota-field" for="inp-spec-total-kb" title="本项目全部规范总正文上限（8～128 KB，至少为单篇上限的 2 倍，默认 16 KB；按项目独立保存）">
+                      <span>总上限</span>
+                      <input type="number" id="inp-spec-total-kb" class="text-input ps-quota-input num" data-spec-limit="total" data-fk="curation:limit-total" min="8" max="128" step="1" value="16" inputmode="numeric" aria-label="本项目规范总上限（KB）" />
+                      <span class="ps-quota-unit">KB</span>
+                    </label>
+                  </div>
+                </div>
+                <div class="ps-body" id="project-specs-body" hidden></div>
+              </div>
+            </section>
+          </div>
+
+          <!-- 【项目配置】子页 3：当前对话派发开关 + 运行缓存安全清理 -->
+          <div id="settings-pane-cache" class="set-pane" data-pane="cache" hidden>
+            <section class="set-section conv-dispatch-section" id="conv-dispatch-section" aria-labelledby="set-conv-dispatch-title">
+              <div class="set-section-head">
+                <h2 class="set-title" id="set-conv-dispatch-title">当前对话编排派发</h2>
+              </div>
+              <div class="set-group">
+                <div class="set-row">
+                  <div class="set-row-main">
+                    <div class="set-row-title">
+                      <span id="lbl-conv-dispatch">当前对话子 Agent 派发</span>
+                      <span id="settings-conv-dispatch-badge" class="health-mini-badge warn">直出 · 已关闭</span>
+                    </div>
+                    <p id="settings-conv-dispatch-desc" class="set-row-desc">关闭后仅当前对话暂停派发子 Agent</p>
+                  </div>
+                  <button type="button" id="btn-settings-toggle-dispatch" class="set-switch" role="switch" aria-checked="false" aria-labelledby="lbl-conv-dispatch" aria-describedby="settings-conv-dispatch-desc">
+                    <span class="set-switch-track" aria-hidden="true"><span class="set-switch-thumb"></span></span>
+                  </button>
+                </div>
+                <div class="set-row set-row--stack">
+                  <div class="set-row-main">
+                    <div class="set-row-title">
+                      <span id="lbl-project-external-session">本项目外部客户端会话留存</span>
+                      <span id="project-external-session-badge" class="set-source-badge is-template">跟随全局 · 已隐藏</span>
+                    </div>
+                    <p id="project-external-session-desc" class="set-row-desc">开启保留后可在外部终端直接恢复调试</p>
+                  </div>
+                  <div class="seg" id="project-external-session-seg" role="radiogroup" aria-labelledby="lbl-project-external-session" aria-describedby="project-external-session-desc">
+                    <button type="button" class="seg-btn" role="radio" aria-checked="true" data-ext-session-mode="inherit">跟随全局</button>
+                    <button type="button" class="seg-btn" role="radio" aria-checked="false" data-ext-session-mode="hidden" tabindex="-1">无痕隐藏</button>
+                    <button type="button" class="seg-btn" role="radio" aria-checked="false" data-ext-session-mode="visible" tabindex="-1">保留可见</button>
+                  </div>
+                </div>
+              </div>
+            </section>
+
+            <!-- v0.1.2 运行缓存清理：只读统计 + 四重安全锁保护的一键清理（运行中 / 有改动 / 未合入的工作树自动保留） -->
+            <section class="set-section runtime-cache-section" id="runtime-cache-section" aria-labelledby="set-cache-title">
+              <div class="set-section-head">
+                <h2 class="set-title" id="set-cache-title">运行缓存清理</h2>
+              </div>
+              <div class="set-group">
+                <div class="set-row rc-row">
+                  <div class="set-row-main">
+                    <div class="rc-summary" id="runtime-cache-summary" role="status" aria-live="polite">当前项目运行缓存 统计中…</div>
+                  </div>
+                  <div class="rc-actions">
+                    <button type="button" id="btn-refresh-runtime-cache" class="ghost-xs-btn" title="重新统计运行缓存" aria-label="重新统计运行缓存">↻</button>
+                    <button type="button" id="btn-clean-runtime-cache" class="ghost-xs-btn is-accent" title="清理临时文件、测试沙盒、日志、会话 WAL 与闲置工作树；规范文档、军师会审纪要（councils/）、发布回执与会话记录始终保留">一键安全清理</button>
+                  </div>
+                </div>
+                <p id="runtime-cache-protected-hint" class="rc-hint" hidden></p>
+              </div>
+            </section>
+          </div>
+        </div>
+      </section>
+
+      <!-- Tab 5: 全局配置（4 个子页面卡片：默认与外观 / 默认成员池 / 扩展平台 / 引擎目录；严禁 role=tab 与 data-view） -->
+      <section id="view-global" class="sw-tab-body" role="tabpanel" hidden aria-label="全局配置">
+        <div class="settings-stack">
+          <div class="set-context-strip">
+            <span class="set-context-lbl">全局共享配置</span>
+            <span class="set-scope-badge is-template">跨项目默认生效</span>
+            <div id="global-preset-save-status" class="save-pill" data-state="idle" title="修改即时自动保存" hidden>
+              <span class="save-pill-dot" aria-hidden="true"></span>
+              <span id="global-preset-save-text" class="save-pill-text" role="status" aria-live="polite">自动保存</span>
+              <button type="button" id="btn-save-global-presets" class="save-pill-retry" hidden>重试</button>
+            </div>
+          </div>
+          <div class="set-subnav-bar">
+            <div class="set-subnav subpage-switcher subpage-switcher--4" id="global-settings-subnav" role="group" aria-label="全局配置子页面">
+              <button type="button" class="set-subtab" aria-pressed="true" data-settings-pane="general" data-pane-scope="global" aria-controls="settings-pane-general">默认与外观</button>
+              <button type="button" class="set-subtab" aria-pressed="false" data-settings-pane="global-roles" data-pane-scope="global" aria-controls="settings-pane-global-roles" tabindex="-1">默认成员池</button>
+              <button type="button" class="set-subtab" aria-pressed="false" data-settings-pane="extensions" data-pane-scope="global" aria-controls="settings-pane-extensions" tabindex="-1">扩展平台</button>
+              <button type="button" class="set-subtab" aria-pressed="false" data-settings-pane="catalog" data-pane-scope="global" aria-controls="settings-pane-catalog" tabindex="-1">引擎目录<span id="settings-catalog-count" class="set-subtab-count num" hidden></span></button>
+            </div>
+          </div>
+
+          <!-- 【全局配置】子页 1：新对话与新项目默认策略、界面外观主题、插件角色底线模板与关于 -->
+          <div id="settings-pane-general" class="set-pane" data-pane="general">
+            <section class="set-section" aria-labelledby="set-dispatch-title">
+              <div class="set-section-head">
+                <h2 class="set-title" id="set-dispatch-title">新对话与新项目默认策略</h2>
+              </div>
+              <div class="set-group" id="dispatch-default-policy-card">
+                <div class="set-row set-row--stack">
+                  <div class="set-row-main">
+                    <div class="set-row-title"><span id="lbl-default-dispatch">新对话默认模式</span> <span id="dispatch-default-save-status" class="set-inline-status" role="status" aria-live="polite"></span></div>
+                    <p class="set-row-desc"><span id="dispatch-default-hint">仅对之后新开的对话生效</span></p>
+                  </div>
+                  <div class="seg seg--modes" id="default-dispatch-seg" role="radiogroup" aria-labelledby="lbl-default-dispatch">
+                    <button type="button" class="seg-btn" role="radio" aria-checked="true" data-default-mode="direct">直出（默认关闭派发）</button>
+                    <button type="button" class="seg-btn" role="radio" aria-checked="false" data-default-mode="relay" tabindex="-1">简单模式</button>
+                    <button type="button" class="seg-btn" role="radio" aria-checked="false" data-default-mode="complex" tabindex="-1">复杂自定义</button>
+                  </div>
+                  <select id="sel-default-dispatch-mode" class="sr-only" tabindex="-1" aria-hidden="true">
+                    <option value="direct">直出（默认关闭派发）</option>
+                    <option value="relay">简单模式</option>
+                    <option value="complex">复杂自定义</option>
+                  </select>
+                </div>
+                <div class="set-row">
+                  <div class="set-row-main">
+                    <div class="set-row-title"><span id="lbl-default-spec-enabled">新项目默认开启项目规范（Spec）</span> <span id="default-spec-save-status" class="set-inline-status" role="status" aria-live="polite"></span></div>
+                    <p id="default-spec-enabled-desc" class="set-row-desc">仅对新建项目生效，不影响已有项目</p>
+                  </div>
+                  <button type="button" id="btn-default-spec-enabled" class="set-switch" role="switch" aria-checked="false" aria-labelledby="lbl-default-spec-enabled" aria-describedby="default-spec-enabled-desc">
+                    <span class="set-switch-track" aria-hidden="true"><span class="set-switch-thumb"></span></span>
+                  </button>
+                </div>
+                <div class="set-row">
+                  <div class="set-row-main">
+                    <div class="set-row-title"><span id="lbl-default-external-session">子 Agent 在外部客户端列表中可见（默认）</span> <span id="default-external-session-save-status" class="set-inline-status" role="status" aria-live="polite"></span></div>
+                    <p id="default-external-session-desc" class="set-row-desc">默认隐藏防刷屏，追问不受影响</p>
+                  </div>
+                  <button type="button" id="btn-default-external-session-visible" class="set-switch" role="switch" aria-checked="false" aria-labelledby="lbl-default-external-session" aria-describedby="default-external-session-desc">
+                    <span class="set-switch-track" aria-hidden="true"><span class="set-switch-thumb"></span></span>
+                  </button>
+                </div>
+              </div>
+            </section>
+
+            <section class="set-section" id="theme-mode-section" aria-labelledby="set-theme-title">
+              <div class="set-section-head">
+                <h2 class="set-title" id="set-theme-title">界面外观主题</h2>
+              </div>
+              <div class="set-group">
+                <div class="set-row set-row--stack">
+                  <div class="set-row-main">
+                    <div class="set-row-title" id="lbl-theme-mode">外观</div>
+                  </div>
+                  <div class="seg seg--theme" id="theme-mode-seg" role="radiogroup" aria-labelledby="lbl-theme-mode">
+                    <button type="button" class="seg-btn" role="radio" aria-checked="true" data-theme-mode="auto">跟随宿主</button>
+                    <button type="button" class="seg-btn" role="radio" aria-checked="false" data-theme-mode="dark" tabindex="-1">暗色</button>
+                    <button type="button" class="seg-btn" role="radio" aria-checked="false" data-theme-mode="light" tabindex="-1">亮色</button>
+                  </div>
+                </div>
+              </div>
+            </section>
+
+            <section class="set-section" id="system-update-section" aria-labelledby="set-update-title" tabindex="-1">
+              <div class="set-section-head">
+                <h2 class="set-title" id="set-update-title">版本与更新</h2>
+              </div>
+              <div class="set-group">
+                <div class="set-row set-row--stack">
+                  <div class="set-row-main">
+                    <div class="set-row-title">当前版本 <span id="system-update-current-version" class="set-source-badge">读取中…</span></div>
+                    <p class="system-update-meta" id="system-update-install-origin">安装形态读取中…</p>
+                    <p id="system-update-status-text" role="status" aria-live="polite">尚未检测更新</p>
+                  </div>
+                </div>
+                <div id="system-update-progress-wrap" class="system-update-progress-wrap" hidden>
+                  <progress id="system-update-progress" class="system-update-progress" max="100" aria-labelledby="system-update-status-text"></progress>
+                  <p id="system-update-progress-meta" class="system-update-progress-meta" hidden></p>
+                </div>
+                <p id="system-update-result" class="system-update-result" role="status" hidden></p>
+                <div class="set-row">
+                  <div class="set-row-main">
+                    <div class="set-row-title" id="lbl-auto-check-updates">自动检测新版本</div>
+                    <p id="auto-check-updates-desc" class="set-row-desc">低频检测，仅提示不自动安装</p>
+                  </div>
+                  <button type="button" id="btn-auto-check-updates" class="set-switch" role="switch" aria-checked="true" aria-labelledby="lbl-auto-check-updates" aria-describedby="auto-check-updates-desc">
+                    <span class="set-switch-track" aria-hidden="true"><span class="set-switch-thumb"></span></span>
+                  </button>
+                </div>
+                <div class="system-update-actions">
+                  <button type="button" id="btn-check-updates-now" class="ghost-xs-btn">↻ 立即检测</button>
+                  <button type="button" id="btn-apply-system-update" class="ghost-xs-btn is-accent" hidden>⬇ 下载并热更新</button>
+                  <button type="button" id="btn-cancel-system-update" class="ghost-xs-btn" hidden>取消更新</button>
+                  <button type="button" id="btn-rollback-system-update" class="ghost-xs-btn" hidden>↺ 回滚至上一版</button>
+                  <a id="link-system-update-release" href="https://github.com/by-buzhou/agent-tower/releases" target="_blank" rel="noopener noreferrer" hidden>查看新版</a>
+                  <button type="button" id="btn-dismiss-update" class="ghost-xs-btn" hidden>忽略本版</button>
+                </div>
+                <div id="system-update-notes" hidden></div>
+              </div>
+            </section>
+
+            <section class="set-section plugin-spec-template-section set-footnote" id="plugin-spec-template-section" aria-label="插件角色底线模板">
+              <div class="ps-template-row">
+                <span id="plugin-spec-template-summary" role="status" aria-live="polite">内置 5 套角色底线模板（只读自动生效）</span>
+              </div>
+            </section>
+
+            <div class="set-about">
+              <span id="settings-about-version">AgentTower</span>
+              <span class="build-tag" id="studio-build-tag">前端构建：旧版（请重新打开面板）</span>
+            </div>
+          </div>
+
+          <!-- 【全局配置】子页 2：默认成员池（直接可编辑分组卡片，保存至 scope: 'global'） -->
+          <div id="settings-pane-global-roles" class="set-pane" data-pane="global-roles" hidden>
+            <div class="set-pane-head">
+              <div class="set-pane-titles">
+                <h2 class="set-title" id="set-global-roster-title" title="新项目首次协作时默认继承，不影响已独立定制的项目">全局默认成员池模板</h2>
+                <p class="set-desc" id="global-roster-template-summary" role="status" aria-live="polite">全局默认模板 读取中…</p>
+              </div>
+            </div>
+            <div id="global-role-presets-grid" class="role-groups"></div>
+          </div>
+
+          <!-- 【全局配置】子页 3：扩展平台 -->
+          <div id="settings-pane-extensions" class="set-pane" data-pane="extensions" hidden>
+            <section class="set-section extension-hub-section" id="extension-hub-section" aria-labelledby="set-ext-title">
+              <div class="set-section-head">
+                <div class="set-pane-titles">
+                  <h2 class="set-title" id="set-ext-title">扩展平台</h2>
+                </div>
+                <div class="set-head-actions">
+                  <button type="button" id="btn-refresh-extensions" class="ghost-xs-btn">↻ 扫描</button>
+                  <button type="button" id="btn-open-ext-wizard" class="ghost-xs-btn">+ 自定义</button>
+                </div>
+              </div>
+              <div id="extension-hub-grid" class="ext-hub"></div>
+            </section>
+          </div>
+
+          <!-- 【全局配置】子页 4：引擎目录（即时搜索 + 手风琴） -->
+          <div id="settings-pane-catalog" class="set-pane catalog-section" data-pane="catalog" hidden>
+            <div class="set-pane-head">
+              <div class="set-pane-titles">
+                <h2 class="set-title">引擎目录</h2>
+                <p id="catalog-sync-subtitle" class="set-desc">已接入引擎与可用模型</p>
+              </div>
+              <button type="button" id="btn-reload-capabilities" class="ghost-xs-btn">↻ 重新探测</button>
+            </div>
+            <label class="sw-search cat-search">
+              <svg class="sw-icon" width="14" height="14" viewBox="0 0 16 16" aria-hidden="true">
+                <circle cx="7" cy="7" r="4.25" fill="none" stroke="currentColor" stroke-width="1.5"/>
+                <path d="m10.25 10.25 3.25 3.25" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+              </svg>
+              <input id="catalog-search-input" type="search" placeholder="搜索模型名称、ID 或引擎（Esc 清空）" autocomplete="off" spellcheck="false" aria-label="搜索引擎目录" />
+            </label>
+            <div id="catalog-providers-container" class="set-group cat-list"></div>
+            <p id="catalog-empty-hint" class="cat-empty" role="status" hidden>没有匹配的模型</p>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <!-- ================================================================
+         3. 底部极简操控栏（Compact Popover Composer）
+         ================================================================ -->
+    <footer id="at-composer" class="compact-composer" aria-label="极简指令操控台">
+      <!-- 排队待发消息胶条 -->
+      <div id="composer-queue-strip" class="composer-queue-strip" hidden>
+        <div class="queue-strip-head">
+          <span class="queue-title">排队待发指令 (<span id="queue-count" class="num">0</span>)</span>
+          <span class="queue-hint">可编辑/调序/一键提升为 Steer</span>
+        </div>
+        <div id="queue-items-list" class="queue-items-list"></div>
+      </div>
+
+      <!-- 弹出式六维参数浮层（点击配置胶囊才展开，平时 0 占用） -->
+      <div id="composer-config-popover" class="composer-config-popover" hidden>
+        <div class="cfg-pop-head">
+          <strong>当前发送目标与引擎参数</strong>
+          <button type="button" id="btn-close-cfg-pop" class="sw-icon-btn sm">✕</button>
+        </div>
+        <div class="cfg-pop-grid">
+          <label class="form-group full-span">
+            <span class="form-label">目标成员 / 会话</span>
+            <select id="comp-target-thread" class="text-select"></select>
+          </label>
+          <label class="form-group full-span">
+            <span class="form-label">角色预设（新建）</span>
+            <select id="comp-preset" class="text-select"><option value="">自定义</option></select>
+          </label>
+          <label class="form-group">
+            <span class="form-label">引擎</span>
+            <select id="comp-provider" class="text-select"></select>
+          </label>
+          <label class="form-group">
+            <span class="form-label">思考强度</span>
+            <select id="comp-effort" class="text-select"></select>
+          </label>
+          <label class="form-group full-span">
+            <span class="form-label">模型</span>
+            <select id="comp-model" class="text-select"></select>
+          </label>
+          <label class="form-group">
+            <span class="form-label">权限策略（随引擎原生档位）</span>
+            <select id="comp-perm-mode" class="text-select" title="各引擎原生权限档位；选择「规划模式」时自动以 Plan 只读规划交互"></select>
+          </label>
+          <label class="form-group">
+            <span class="form-label">目录隔离</span>
+            <select id="comp-isolation" class="text-select">
+              <option value="shared">共享项目主目录</option>
+              <option value="worktree">独立 Worktree</option>
+            </select>
+          </label>
+          <div class="form-group" style="justify-content:flex-end;">
+            <label class="scope-switch">
+              <input type="checkbox" id="chk-fresh-context" />
+              <span>下轮开启全新上下文</span>
+            </label>
+          </div>
+          <div class="form-group" style="grid-column: 1 / -1;">
+            <label class="scope-switch">
+              <input type="checkbox" id="comp-ephemeral-chk" />
+              <span>单次临时成员（不复用卡片且强制无痕）</span>
+            </label>
+          </div>
+        </div>
+      </div>
+
+      <!-- 极简控制行：目标/模型配置胶囊 + 输入框 + 智能状态动作钮 -->
+      <div class="composer-bar-main">
+        <button type="button" id="btn-composer-cfg-pill" class="composer-cfg-pill" title="点击切换发送目标成员、引擎、模型与思考强度">
+          <span id="comp-pill-text">🎯 新建会话 · K3.1 Pro · max ▾</span>
+        </button>
+
+        <div class="composer-input-row">
+          <textarea
+            id="comp-prompt-input"
+            class="comp-textarea"
+            rows="1"
+            placeholder="向当前目标发指令（空闲续聊 / 运行中 Steer 纠偏，Ctrl+Enter 发送）..."
+          ></textarea>
+          <div class="composer-btn-cluster">
+            <div id="comp-idle-actions" class="comp-btn-group">
+              <button type="button" id="btn-comp-send" class="hdr-primary-btn send-btn">发送</button>
+            </div>
+            <div id="comp-running-actions" class="comp-btn-group" hidden>
+              <button type="button" id="btn-comp-steer" class="steer-btn" title="实时向运行中 Agent 注入纠偏指令">⚡ Steer</button>
+              <button type="button" id="btn-comp-queue" class="queue-btn" title="排入当前线程待办队列">排队</button>
+              <button type="button" id="btn-comp-stop" class="stop-btn" title="先优雅中断，2 秒未停可点击强制终止">■ 中断</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </footer>
+
+    <!-- ================================================================
+         4. 成员专属详情抽屉（点击 Members 行滑出深潜）
+         ================================================================ -->
+    <div id="member-drawer-backdrop" class="modal-backdrop" hidden>
+      <aside class="slide-drawer" role="dialog" aria-modal="true" aria-labelledby="md-title">
+        <div class="drawer-head">
+          <div style="min-width:0;">
+            <h2 id="md-title" class="md-drawer-title">成员详情</h2>
+            <div id="md-subtitle" class="md-drawer-sub"></div>
+          </div>
+          <div style="display:flex;align-items:center;gap:6px;flex-shrink:0;">
+            <button type="button" id="btn-md-jump-host" class="ghost-xs-btn host-jump-btn" hidden>↗ 主窗口对话</button>
+            <button type="button" id="btn-md-delete" class="ghost-xs-btn danger-txt" title="移除或归档此历史会话">🗑 删除</button>
+            <button type="button" id="btn-close-member-drawer" class="sw-icon-btn" aria-label="关闭成员详情">✕</button>
+          </div>
+        </div>
+        <div id="md-actions-bar" class="md-actions-bar"></div>
+        <div id="md-timeline-body" class="md-timeline-body"></div>
+      </aside>
+    </div>
+
+    <!-- ================================================================
+         5. 抽屉：新建 / 派发多引擎任务（归属于当前选中项目）
+         ================================================================ -->
+    <div id="dispatch-drawer-backdrop" class="modal-backdrop" hidden>
+      <aside class="slide-drawer" role="dialog" aria-modal="true" aria-labelledby="dispatch-drawer-title">
+        <div class="drawer-head">
+          <h2 id="dispatch-drawer-title">新建 / 派发多引擎任务</h2>
+          <button type="button" id="btn-close-dispatch" class="sw-icon-btn" aria-label="关闭抽屉">✕</button>
+        </div>
+
+        <div class="drawer-mode-tabs" id="dispatch-mode-tabs">
+          <button type="button" class="seg-mini-btn active" data-dmode="single">派发单子任务</button>
+          <button type="button" class="seg-mini-btn" data-dmode="batch">多Agent并行扇出</button>
+          <button type="button" class="seg-mini-btn" data-dmode="thread">新建顶层会话</button>
+        </div>
+
+        <div class="drawer-body">
+          <div id="dispatch-single-pane">
+            <div class="form-group" id="dispatch-preset-chips-wrap">
+              <span class="form-label">当前模式阵容成员（一键套用）</span>
+              <div id="dispatch-preset-chips" class="preset-quick-chips"></div>
+            </div>
+
+            <div class="form-row-2">
+              <label class="form-group">
+                <span class="form-label">任务标题（可选）</span>
+                <input type="text" id="disp-title" class="text-input" placeholder="例如：实现状态机单元测试" />
+              </label>
+              <label class="form-group" id="disp-role-wrap">
+                <span class="form-label">角色类型 (Role)</span>
+                <select id="disp-role" class="text-select">
+                  <option value="implementation">implementation · 编码实现</option>
+                  <option value="design">design · 架构方案设计</option>
+                  <option value="research">research · 深度调研排查</option>
+                  <option value="review">review · 代码挑刺审查</option>
+                  <option value="test">test · 测试验证</option>
+                  <option value="general">general · 通用任务</option>
+                </select>
+              </label>
+            </div>
+
+            <div class="form-row-3">
+              <label class="form-group">
+                <span class="form-label">执行引擎</span>
+                <select id="disp-provider" class="text-select"></select>
+              </label>
+              <label class="form-group">
+                <span class="form-label">模型</span>
+                <select id="disp-model" class="text-select"></select>
+              </label>
+              <label class="form-group">
+                <span class="form-label">思考强度</span>
+                <select id="disp-effort" class="text-select"></select>
+              </label>
+            </div>
+
+            <div class="form-row-2">
+              <label class="form-group">
+                <span class="form-label">权限策略（随引擎原生档位）</span>
+                <select id="disp-perm" class="text-select" title="各引擎原生权限档位；选择「规划模式」时自动以 Plan 只读规划交互"></select>
+              </label>
+              <label class="form-group">
+                <span class="form-label">工作区隔离</span>
+                <select id="disp-isolation" class="text-select">
+                  <option value="shared" selected>共享项目主目录</option>
+                  <option value="worktree">独立 Worktree</option>
+                </select>
+              </label>
+            </div>
+
+            <label class="form-group">
+              <span class="form-label">所属项目工作目录 (cwd)</span>
+              <input type="text" id="disp-cwd" class="text-input" placeholder="默认使用当前选中项目根目录" />
+            </label>
+
+            <label class="form-group">
+              <span class="form-label">详细任务指令 (Prompt)</span>
+              <textarea id="disp-prompt" class="text-area" rows="5" placeholder="清晰描述任务边界与验收标准..."></textarea>
+            </label>
+          </div>
+
+          <div id="dispatch-batch-pane" hidden>
+            <div class="batch-templates-bar">
+              <button type="button" id="btn-tpl-council" class="ghost-xs-btn">填入：军师团（同题原意盲评）</button>
+              <button type="button" id="btn-tpl-tri-exec" class="ghost-xs-btn">填入：多引擎独立 Worktree 并行开发</button>
+              <button type="button" id="btn-add-batch-row" class="ghost-xs-btn">+ 添加并行子任务</button>
+            </div>
+            <div id="batch-rows-container" class="batch-rows-container"></div>
+          </div>
+
+          <label class="scope-switch disp-ephemeral-switch">
+            <input type="checkbox" id="disp-ephemeral-chk" />
+            <span>单次临时成员（不复用卡片且强制无痕）</span>
+          </label>
+        </div>
+
+        <div class="drawer-foot">
+          <button type="button" id="btn-cancel-dispatch" class="ghost-xs-btn">取消</button>
+          <button type="button" id="btn-submit-dispatch" class="hdr-primary-btn">立即派发启动</button>
+        </div>
+      </aside>
+    </div>
+
+    <!-- ================================================================
+         6. 弹窗集合（军师团、重试、扩展平台向导）
+         ================================================================ -->
+    <div id="council-modal-backdrop" class="modal-backdrop" hidden>
+      <div class="dialog-box" role="dialog" aria-modal="true" aria-labelledby="council-modal-title">
+        <div class="drawer-head">
+          <h2 id="council-modal-title">🧠 召唤军师团并行评方案</h2>
+          <button type="button" id="btn-close-council" class="sw-icon-btn">✕</button>
+        </div>
+        <div class="dialog-body">
+          <p id="council-dialog-note" class="dialog-note">将向已勾选军师并发下发同一份原始诉求进行只读独立盲评（保持用户原意、零倾向注入，可取消勾选）：</p>
+          <div id="council-members-list" class="council-members-list" role="group" aria-label="参与评审的军师"></div>
+          <label class="form-group">
+            <span class="form-label">用户原意与会审议题（必填）</span>
+            <textarea id="council-topic-input" class="text-area" rows="4" placeholder="粘贴或输入用户原话与已知约束，不附加任何预设方案倾向..."></textarea>
+          </label>
+        </div>
+        <div class="drawer-foot">
+          <button type="button" id="btn-cancel-council" class="ghost-xs-btn">取消</button>
+          <button type="button" id="btn-confirm-council" class="hdr-primary-btn">⚡ 并发推演</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="review-modal-backdrop" class="modal-backdrop" hidden>
+      <div class="dialog-box review-dialog-box" role="dialog" aria-modal="true" aria-labelledby="review-modal-title">
+        <div class="drawer-head">
+          <h2 id="review-modal-title">🔍 代码终审 · 审改一体闭环</h2>
+          <button type="button" id="btn-close-review" class="sw-icon-btn">✕</button>
+        </div>
+        <div class="dialog-body">
+          <div id="review-target-subtitle" class="review-target-hint">审查目标：当前对话工作区</div>
+          <div id="review-pool-hint" class="review-pool-hint" role="alert" hidden></div>
+
+          <div class="form-group" id="review-member-wrap" hidden>
+            <span class="form-label">评审官（复杂阵容审核阶段已勾选）</span>
+            <div id="review-member-chips" class="preset-quick-chips" role="group" aria-label="选择评审官"></div>
+          </div>
+
+          <div class="form-group">
+            <span class="form-label">审查模式</span>
+            <div id="review-mode-pair" class="review-mode-pair">
+              <button type="button" id="btn-review-mode-fix" class="review-mode-card active" data-review-mode="review_and_fix" aria-pressed="true">
+                <span class="review-mode-title">🔧 审改一体闭环</span>
+                <span class="review-mode-sub">直接修复缺陷并自测，完成后汇报主会话</span>
+              </button>
+              <button type="button" id="btn-review-mode-read-only" class="review-mode-card" data-review-mode="read_only" aria-pressed="false">
+                <span class="review-mode-title">👁 仅只读诊断</span>
+                <span class="review-mode-sub">仅输出缺陷报告，不修改任何仓库文件</span>
+              </button>
+            </div>
+          </div>
+
+          <div class="form-row-2">
+            <label class="form-group">
+              <span class="form-label">审查范围</span>
+              <select id="review-scope-select" class="text-select">
+                <option value="uncommitted">当前工作树未提交改动</option>
+                <option value="branch">对比基点分支</option>
+              </select>
+            </label>
+            <label class="form-group" id="review-branch-wrap" hidden>
+              <span class="form-label">基点分支名称</span>
+              <input type="text" id="review-base-branch" class="text-input" value="main" placeholder="例如：main 或 master" />
+            </label>
+          </div>
+
+          <div class="form-row-3">
+            <label class="form-group">
+              <span class="form-label">引擎</span>
+              <select id="review-provider" class="text-select"></select>
+            </label>
+            <label class="form-group">
+              <span class="form-label">模型</span>
+              <select id="review-model" class="text-select"></select>
+            </label>
+            <label class="form-group">
+              <span class="form-label">思考强度</span>
+              <select id="review-effort" class="text-select"></select>
+            </label>
+          </div>
+
+          <label class="form-group">
+            <span class="form-label">审查目标目录 / Worktree</span>
+            <input type="text" id="review-cwd-input" class="text-input" placeholder="默认自动带入当前工作区或选中 Worktree" />
+          </label>
+
+          <label class="form-group">
+            <span class="form-label">重点关注说明</span>
+            <textarea id="review-focus-input" class="text-area" rows="3" placeholder="可选：指定希望终审官重点排查的模块、边界条件或并发状态一致性风险..."></textarea>
+          </label>
+        </div>
+        <div class="drawer-foot">
+          <button type="button" id="btn-cancel-review" class="ghost-xs-btn">取消</button>
+          <button type="button" id="btn-confirm-review" class="hdr-primary-btn">立即启动终审</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="retry-modal-backdrop" class="modal-backdrop" hidden>
+      <div class="dialog-box" role="dialog" aria-modal="true" aria-labelledby="retry-modal-title">
+        <div class="drawer-head">
+          <h2 id="retry-modal-title">⇄ 切换模型或思考强度重试</h2>
+          <button type="button" id="btn-close-retry" class="sw-icon-btn">✕</button>
+        </div>
+        <div class="dialog-body">
+          <div class="form-row-3">
+            <label class="form-group">
+              <span class="form-label">引擎</span>
+              <select id="retry-provider" class="text-select"></select>
+            </label>
+            <label class="form-group">
+              <span class="form-label">模型</span>
+              <select id="retry-model" class="text-select"></select>
+            </label>
+            <label class="form-group">
+              <span class="form-label">思考强度</span>
+              <select id="retry-effort" class="text-select"></select>
+            </label>
+          </div>
+        </div>
+        <div class="drawer-foot">
+          <button type="button" id="btn-cancel-retry" class="ghost-xs-btn">取消</button>
+          <button type="button" id="btn-confirm-retry" class="hdr-primary-btn">立即发起重试</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="ext-modal-backdrop" class="modal-backdrop" hidden>
+      <div class="dialog-box ext-wizard-dialog" role="dialog" aria-modal="true" aria-labelledby="ext-modal-title">
+        <div class="drawer-head">
+          <h2 id="ext-modal-title">接入外部 ACP / CLI 编程平台</h2>
+          <button type="button" id="btn-close-ext" class="sw-icon-btn" aria-label="关闭">✕</button>
+        </div>
+        <div class="dialog-body ext-wizard-body">
+          <div class="dlg-section-label">基本信息</div>
+          <div class="form-row-2">
+            <label class="form-group">
+              <span class="form-label">平台标识 ID</span>
+              <input type="text" id="ext-id" class="text-input" placeholder="如 opencode 或 my-acp-agent" />
+            </label>
+            <label class="form-group">
+              <span class="form-label">显示名称</span>
+              <input type="text" id="ext-name" class="text-input" placeholder="如 OpenCode CLI" />
+            </label>
+          </div>
+          <div class="form-row-2">
+            <label class="form-group">
+              <span class="form-label">通信协议模式</span>
+              <select id="ext-protocol" class="text-select">
+                <option value="acp">ACP 标准双向流式协议 (JSON-RPC 2.0)</option>
+                <option value="cli">CLI 命令行模板 ({{model}} / {{prompt}})</option>
+              </select>
+            </label>
+            <label class="form-group" style="justify-content:flex-end;">
+              <label class="scope-switch" style="padding:6px 0;">
+                <input type="checkbox" id="ext-enabled" checked />
+                <span><strong>启用此扩展平台</strong></span>
+              </label>
+            </label>
+          </div>
+          <div class="dlg-section-label">启动方式</div>
+          <div class="form-row-2">
+            <label class="form-group">
+              <span class="form-label">可执行命令或二进制路径</span>
+              <input type="text" id="ext-command" class="text-input" placeholder="如 opencode / cursor-agent / aider" />
+            </label>
+            <label class="form-group">
+              <span class="form-label">启动参数或 CLI 模板</span>
+              <input type="text" id="ext-args" class="text-input" placeholder="ACP 填: acp | CLI 填: --model {{model}} --message {{prompt}}" />
+            </label>
+          </div>
+          <div class="ext-probe-bar">
+            <button type="button" id="btn-ext-probe" class="ghost-xs-btn">握手探测并拉取模型</button>
+            <span class="ext-probe-hint">实时握手提取模型与模式列表</span>
+          </div>
+          <div id="ext-probe-result" class="ext-probe-result" hidden></div>
+          <div class="dlg-section-label">模型与环境</div>
+          <label class="form-group">
+            <span class="form-label">可用模型列表（每行一个：<code>modelId</code> 或 <code>modelId | 显示名称</code>）</span>
+            <textarea id="ext-models" class="text-area mono-area" rows="4" placeholder="default | 默认模型"></textarea>
+          </label>
+          <div class="form-row-2">
+            <label class="form-group">
+              <span class="form-label">支持思考档位（逗号分隔）</span>
+              <input type="text" id="ext-efforts" class="text-input" value="low, medium, high" />
+            </label>
+            <label class="form-group">
+              <span class="form-label">附加环境变量（KEY=VALUE，单向安全保存）</span>
+              <input type="text" id="ext-env" class="text-input" placeholder="留空继承系统环境" />
+            </label>
+          </div>
+        </div>
+        <div class="drawer-foot ext-wizard-foot">
+          <button type="button" id="btn-ext-remove" class="ghost-xs-btn danger-txt" hidden>停用/移除此平台</button>
+          <div style="display:flex;gap:8px;margin-left:auto;">
+            <button type="button" id="btn-cancel-ext" class="ghost-xs-btn">取消</button>
+            <button type="button" id="btn-save-ext" class="hdr-primary-btn">保存并启用</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div id="custom-model-modal-backdrop" class="modal-backdrop" hidden>
+      <div class="dialog-box custom-model-dialog" role="dialog" aria-modal="true" aria-labelledby="custom-model-modal-title">
+        <div class="drawer-head">
+          <h2 id="custom-model-modal-title">手动输入自定义模型 ID</h2>
+          <button type="button" id="btn-close-custom-model" class="sw-icon-btn" aria-label="关闭">✕</button>
+        </div>
+        <div class="dialog-body">
+          <p id="custom-model-hint" class="sub-note" style="margin:0;">请输入自定义模型 ID，将原样透传给所选引擎，并在下拉框中保留选中。</p>
+          <label class="form-group">
+            <span class="form-label">模型 ID</span>
+            <input type="text" id="custom-model-id-input" class="text-input mono-area" placeholder="例如：gpt-6.2-astra / kimi-code/k3.1-pro / deepseek-reasoner" autocomplete="off" />
+          </label>
+        </div>
+        <div class="drawer-foot">
+          <button type="button" id="btn-cancel-custom-model" class="ghost-xs-btn">取消</button>
+          <button type="button" id="btn-confirm-custom-model" class="hdr-primary-btn">确认使用</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="toast-container" class="toast-container" aria-live="polite"></div>
+  </div>
+
+  <script src="./preload.js"></script>
+  <script src="./app.js"></script>
+</body>
+</html>

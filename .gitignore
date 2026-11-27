@@ -1,0 +1,77 @@
+# =============================================================================
+# AgentTower — Git Ignore Rules
+# 严禁将运行态面板交流数据、Worktree、测试沙盒、日志、凭据与临时备份提交进 Git
+# =============================================================================
+
+# 1. 项目专属运行时与面板沟通数据仓（对话 SQLite、Worktrees、测试运行沙盒、日志、临时索引）
+# >>> agent-tower (managed: ignore runtime state, allow committable project specs)
+.agent-tower/*
+!.agent-tower/spec/
+.agent-tower/spec/*
+!.agent-tower/spec/INDEX.md
+!.agent-tower/spec/01-business/
+!.agent-tower/spec/01-business/**
+!.agent-tower/spec/02-coding/
+!.agent-tower/spec/02-coding/**
+!.agent-tower/spec-archive/
+.agent-tower/spec-archive/*
+!.agent-tower/spec-archive/INDEX.md
+!.agent-tower/spec-archive/manifest.json
+!.agent-tower/spec-archive/01-business/
+!.agent-tower/spec-archive/01-business/**
+!.agent-tower/spec-archive/02-coding/
+!.agent-tower/spec-archive/02-coding/**
+!.agent-tower/docs/
+!.agent-tower/docs/**
+# <<< agent-tower
+.agent-studio/
+worktrees/
+test-runs/
+sandbox-runs/
+
+# 2. 数据库与流式日志文件（全局兜底拦截）
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.db
+*.db-wal
+*.db-shm
+*.log
+npm-debug.log*
+
+# 3. 依赖、测试覆盖率与浏览器自动化缓存
+node_modules/
+coverage/
+.playwright-mcp/
+dist/
+
+# 4. 守护进程握手租约、环境变量与敏感凭据
+.env*
+!.env.example
+daemon-lease.json
+daemon-spawn.lock
+global-settings.json
+standalone-launch-*.url
+auth.json
+*.secret
+*.token
+secrets.json
+tokens.json
+
+# 5. 临时文件、历史备份与系统杂物（防抛屎硬约束）
+tmp/
+tmp-*
+.tmp*
+*.tmp
+*.bak
+*.bak.*
+archive-legacy/
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.sqlite*
+*.log.*
+*.bak*
+*lease*.json
+config.json
+cc-switch.db*

@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "orchestrator": {
+      "command": "node",
+      "args": [
+        "${PLUGIN_ROOT}/sidecars/studio/mcp-entry.mjs"
+      ],
+      "env": {
+        "AGENT_TOWER_PLUGIN_ROOT": "${PLUGIN_ROOT}",
+        "AGENT_TOWER_PLUGIN_DATA": "${PLUGIN_DATA}"
+      }
+    }
+  }
+}

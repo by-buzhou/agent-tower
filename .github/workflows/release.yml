@@ -1,0 +1,92 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+env:
+  AGENT_TOWER_DISABLE_UPDATE_CHECK: '1'
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Verify version consistency
+        id: version
+        shell: pwsh
+        run: |
+          $pluginVer = (Get-Content -Raw plugin.json | ConvertFrom-Json).version
+          $pkgVer = (Get-Content -Raw package.json | ConvertFrom-Json).version
+          if ($pluginVer -ne $pkgVer) {
+            throw "Version mismatch: plugin.json=$pluginVer package.json=$pkgVer"
+          }
+          if ($env:GITHUB_REF_TYPE -eq "tag") {
+            $tag = $env:GITHUB_REF_NAME
+            $tagVer = $tag -replace '^v', ''
+            if ($tagVer -ne $pluginVer) {
+              throw "Tag version mismatch: tag=$tag plugin.json=$pluginVer"
+            }
+          } else {
+            $tag = "v$pluginVer"
+          }
+          "version=$pluginVer" >> $env:GITHUB_OUTPUT
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+      - name: Syntax and architecture check
+        run: npm run check
+      - name: Fast unit test suite
+        run: npm run test:fast
+      - name: Build deterministic release bundle
+        shell: pwsh
+        run: node scripts/build-release.mjs --out-dir dist-release --tag "${{ steps.version.outputs.tag }}"
+      - name: Verify extracted ZIP without .git
+        shell: pwsh
+        run: |
+          $ver = "${{ steps.version.outputs.version }}"
+          $verifyDir = Join-Path "${{ runner.temp }}" "at-release-verify"
+          if (Test-Path -LiteralPath $verifyDir) { Remove-Item -LiteralPath $verifyDir -Recurse -Force }
+          New-Item -ItemType Directory -Force -Path $verifyDir | Out-Null
+          tar -xf "dist-release/agent-tower-v$ver.zip" -C $verifyDir
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (Test-Path -LiteralPath (Join-Path $verifyDir ".git")) {
+            throw "Unexpected .git directory inside release archive"
+          }
+          Push-Location -LiteralPath $verifyDir
+          try {
+            npm run check
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $env:AGENT_TOWER_VALIDATE_STAGE_IN_REPO = '1'
+            node scripts/publish-plugin.mjs --stage-only
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } finally {
+            Pop-Location
+          }
+      - name: Publish GitHub Release assets
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ver = "${{ steps.version.outputs.version }}"
+          $tag = "${{ steps.version.outputs.tag }}"
+          $zip = "dist-release/agent-tower-v$ver.zip"
+          $manifest = "dist-release/release-manifest.json"
+          $sums = "dist-release/SHA256SUMS"
+          gh release view $tag 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag $zip $manifest $sums --clobber
+          } else {
+            gh release create $tag $zip $manifest $sums --title $tag --generate-notes
+          }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

@@ -1,0 +1,22 @@
+{
+  "command": "node",
+  "args": ["main.mjs"],
+  "env": {
+    "AGENT_TOWER_SURFACE": "sidecar",
+    "AGENT_TOWER_BUNDLE_REV": "v020-spec-assembler"
+  },
+  "restart_policy": "always",
+  "display_name": "AgentTower",
+  "description": "实时监控与操控宿主原生 Antigravity、Kimi Code、Codex 及开放 ACP/CLI 扩展平台的多 Agent 思考流、工具调用与 Worktree Diff。",
+  "has_web_ui": true,
+  "ui_config": {
+    "display_name": "AgentTower",
+    "views": [
+      {
+        "path": "/",
+        "entrypoint": "SIDECAR_UI_ENTRYPOINT_AUX_PANE",
+        "title": "AgentTower"
+      }
+    ]
+  }
+}

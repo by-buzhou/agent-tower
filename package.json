@@ -1,0 +1,20 @@
+{
+  "name": "agent-tower",
+  "version": "0.3.3.1",
+  "private": true,
+  "type": "module",
+  "license": "AGPL-3.0-only",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "check": "node --experimental-vm-modules --no-warnings scripts/check.mjs",
+    "test:fast": "node scripts/test.mjs fast",
+    "test:unit": "node scripts/test.mjs unit",
+    "clean:sandbox": "node scripts/clean-sandbox.mjs",
+    "build:release": "node scripts/build-release.mjs",
+    "setup": "node scripts/publish-plugin.mjs",
+    "publish:plugin": "node scripts/publish-plugin.mjs",
+    "status:plugin": "node scripts/publish-plugin.mjs --status"
+  }
+}

@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="tower-title">
+  <title id="tower-title">AgentTower</title>
+  <rect x="1" y="1" width="62" height="62" rx="14" fill="#102742"/>
+  <g fill="none" stroke="#64d6d2" stroke-linecap="round" stroke-width="2.5">
+    <path d="M22 12a14 14 0 0 0-4 9m24-9a14 14 0 0 1 4 9M26 15a8 8 0 0 0-2 5m14-5a8 8 0 0 1 2 5"/>
+  </g>
+  <path d="M32 14v10" stroke="#e5f6ff" stroke-width="3"/><circle cx="32" cy="12" r="3" fill="#ffbd59"/>
+  <path d="M16 24h32l-5 12H21z" fill="#98ede8"/><path d="m24 28 2 5m6-5v5m8-5-2 5" stroke="#173652" stroke-width="2.5"/>
+  <path d="M26 39h12l3 14H23z" fill="#e7f5ff"/><path d="M14 55h36" stroke="#ffbd59" stroke-width="3" stroke-linecap="round"/>
+</svg>
