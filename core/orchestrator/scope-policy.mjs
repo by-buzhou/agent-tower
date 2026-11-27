@@ -454,6 +454,7 @@ export function createScopePolicyModule(ctx) {
     const specs = assembleSpecPrompt({ inventory, cwd: checkout, repoRoot, role, rawPrompt,
       dynamicPrompt: [ticket?.reviewFilesBlock, planWarning].filter(Boolean).join("\n\n"), selection, planDoc,
       review: ticket?.reviewSpec, specEnabled, controlDir: ctx.dataDir,
+      orchestrationMode: base?.orchestrationMode || readConversationPolicy(root).orchestrationMode,
       specLimits: specEnabled ? (ctx.specs?.projectSpecLimits?.(repoRoot) ?? ctx.db.getProjectSpec?.(repoRoot)) : undefined,
       ...(role === "curator" && specEnabled ? ctx.specs?.curatorPromptContext?.(repoRoot, root) : {}) });
     const planKey = specs.full.meta.items.find(item => item.kind === "plan")?.key;

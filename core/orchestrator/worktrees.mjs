@@ -183,7 +183,10 @@ export function createWorktreesModule(ctx) {
     }
     assertWorktreeIdle(real, action);
     ctx.worktreeOperations.set(real, action);
-    try { return await operation(real); } finally { ctx.worktreeOperations.delete(real); }
+    try {
+      await ctx.engineManager?.waitForPathClosed?.(real);
+      return await operation(real);
+    } finally { ctx.worktreeOperations.delete(real); }
   }
 
   function worktreeEventScopes(targetPath, params = {}) {

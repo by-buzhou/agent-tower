@@ -120,7 +120,9 @@ export function createReviewModule(ctx) {
       checkReviewAvailability(params, reviewRootConvId, repoRoot, readOnly).bypass;
     if (beforeSnapshot) return beforeSnapshot;
     const scope = params.scope || "uncommitted";
+    const snapshotStartedAt = Date.now();
     const reviewSpec = await snapshotReview({ scope, baseBranch: params.baseBranch, commitSha: params.commitSha, customPrompt: params.prompt, readOnly }, targetCwd);
+    const snapshotMs = Math.max(0, Date.now() - snapshotStartedAt);
     const { reviewFilesBlock } = reviewSpec;
     const afterSnapshot = ctx.scopePolicy.dispatchBypass(params);
     if (afterSnapshot) return afterSnapshot;
@@ -228,7 +230,7 @@ export function createReviewModule(ctx) {
       interactionMode,
       prompt: userDisplayPrompt,
       inputIntent: "review",
-      meta: { taskId, title, ...resolved.routing, ...(params.inheritHostMcp === true ? { inheritHostMcp: true } : {}), ...specSelection(params), reviewSpec, orchestrationMode: reviewPolicy.orchestrationMode, ...(resolved.routing?.temporaryOverride ? { temporaryOverride: true } : {}) },
+      meta: { taskId, title, ...resolved.routing, ...(params.inheritHostMcp === true ? { inheritHostMcp: true } : {}), ...specSelection(params), reviewSpec, snapshotMs, orchestrationMode: reviewPolicy.orchestrationMode, ...(resolved.routing?.temporaryOverride ? { temporaryOverride: true } : {}) },
       cwd: targetCwd,
       ...(nativeReview ? { startedAt } : {}),
     });
@@ -357,8 +359,8 @@ export function createReviewModule(ctx) {
       launchDriver({ onEvent, prompt }) {
         reviewResult = undefined;
         const handle = ctx.engineManager.runReview({
-          cwd: targetCwd, scope, baseBranch: params.baseBranch, commitSha: params.commitSha,
-          model, effort, ephemeral: true, prompt, onEvent,
+          threadId, cwd: targetCwd, scope, baseBranch: params.baseBranch, commitSha: params.commitSha,
+          model, effort, ephemeral: true, inheritHostMcp: params.inheritHostMcp === true, prompt, onEvent,
         });
         return { ...handle, result: handle.result.then(result => {
           reviewResult = result;

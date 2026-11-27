@@ -1,11 +1,9 @@
 import { resolveSessionPrompt } from "../spec-context.mjs";
 import { createInterface } from "node:readline";
 import * as crypto from "node:crypto";
-import { statSync } from "node:fs";
-import { spawnSync } from "node:child_process";
 import { assertReadOnlySupport, isInheritedEffort, isInheritedModel, normalizePermissionModeForProvider } from "../catalog.mjs";
 import { ensureMainRoot, nativePath } from "../storage-paths.mjs";
-import { spawnNoWindow, buildCleanChildEnv, classifyEngineError, forceKillProcessTree, resolveClaudeBinary, safeCatalogText, safeEngineError } from "./proc-utils.mjs";
+import { binaryFingerprint, captureNoWindow, spawnNoWindow, buildCleanChildEnv, classifyEngineError, forceKillProcessTree, resolveClaudeBinary, safeCatalogText, safeEngineError } from "./proc-utils.mjs";
 
 const CLAUDE_CLI_MODES = new Set(["plan", "default", "acceptEdits", "auto", "dontAsk", "bypassPermissions"]);
 const HEARTBEAT_INTERVAL_MS = 5000;
@@ -13,35 +11,29 @@ const GRACEFUL_CANCEL_MS = 1500;
 const ALLOW_DECISIONS = new Set(["approve_once", "approve", "allow", "allow_once", "accept", "approve_always", "allow_always"]);
 const strictMcpProbeCache = new Map();
 
-function probeStrictMcpFlag(command, prefixArgs, resolvedPath) {
-  if (!resolvedPath) return false;
-  let fingerprint;
-  try {
-    const stat = statSync(resolvedPath);
-    fingerprint = `${resolvedPath}:${stat.mtimeMs}:${stat.size}`;
-  } catch {
-    fingerprint = `${resolvedPath}:0:0`;
+function probeStrictMcpFlag(bin, cwd) {
+  const fingerprint = binaryFingerprint(bin);
+  let entry = strictMcpProbeCache.get(fingerprint);
+  if (!entry) {
+    entry = { supported: false };
+    entry.pending = captureNoWindow(bin.command, [...(bin.prefixArgs || []), "--help"], {
+      cwd, env: buildCleanChildEnv(bin.env), timeoutMs: 1500, detached: process.platform !== "win32",
+    }).then(({ stdout, stderr }) => {
+      entry.supported = (stdout + "\n" + stderr).includes("--strict-mcp-config");
+      return entry.supported;
+    }, () => false);
+    strictMcpProbeCache.set(fingerprint, entry);
+    while (strictMcpProbeCache.size > 32) strictMcpProbeCache.delete(strictMcpProbeCache.keys().next().value);
   }
-  if (strictMcpProbeCache.has(fingerprint)) return strictMcpProbeCache.get(fingerprint);
-  let supported = false;
-  try {
-    const result = spawnSync(command, [...prefixArgs, "--help"], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
-      timeout: 1500,
-      maxBuffer: 1024 * 1024,
-      windowsHide: true,
-    });
-    supported = !result.error && result.status === 0 && `${result.stdout || ""}\n${result.stderr || ""}`.includes("--strict-mcp-config");
-  } catch {}
-  strictMcpProbeCache.set(fingerprint, supported);
-  while (strictMcpProbeCache.size > 32) strictMcpProbeCache.delete(strictMcpProbeCache.keys().next().value);
-  return supported;
+  return entry.pending;
 }
 
+// Existing synchronous callers can inspect the last probe result without spawning.
 export function supportsStrictMcpFlag(binaryPath) {
-  return /\.(?:m?js|cjs)$/i.test(binaryPath)
-    ? probeStrictMcpFlag(process.execPath, [binaryPath], binaryPath) : probeStrictMcpFlag(binaryPath, [], binaryPath);
+  const bin = /\.(?:mjs|cjs|js)$/i.test(binaryPath)
+    ? { command: process.execPath, prefixArgs: [binaryPath], resolvedPath: binaryPath }
+    : { command: binaryPath, prefixArgs: [], resolvedPath: binaryPath };
+  return strictMcpProbeCache.get(binaryFingerprint(bin))?.supported ?? false;
 }
 
 /**
@@ -83,21 +75,48 @@ function decisionOf(payload) {
   return String(payload === true ? "approve_once" : payload ?? "").trim().toLowerCase();
 }
 
-export function runClaudeTurn({ runId, threadId, model, effort, permissionMode, interactionMode, cwd,
-  nativeSessionId, ephemeral, prompt, freshSessionPrompt, onEvent, onPermissionRequest, onQuestionRequest,
-  resolveBinary = resolveClaudeBinary, inheritHostMcp, options, params, strictMcpSupport } = {}) {
+export function runClaudeTurn(opts = {}) {
+  const { permissionMode, interactionMode, resolveBinary = resolveClaudeBinary, inheritHostMcp,
+    options, params, strictMcpSupport } = opts;
   assertReadOnlySupport("claude-code", permissionMode);
   const mode = resolveClaudePermissionMode(permissionMode, interactionMode);
   const bin = resolveBinary();
+  const cwd = nativePath(opts.cwd || process.env.AGENT_TOWER_DEFAULT_ROOT || ensureMainRoot());
+  const start = strict => startClaudeTurn({ ...opts, cwd }, bin, mode, strict);
+  if (inheritHostMcp === true || options?.inheritHostMcp === true || params?.inheritHostMcp === true) return start(false);
+  const supported = strictMcpSupport ? strictMcpSupport(bin) : probeStrictMcpFlag(bin, cwd);
+  if (typeof supported === "boolean") return start(supported);
+
+  let cancelled = false, handle;
+  const result = Promise.resolve(supported).then((strict) => {
+    if (cancelled) return { status: "interrupted", stopReason: "cancelled" };
+    handle = start(strict);
+    return handle.result;
+  }).catch(error => {
+    const detail = safeEngineError(error);
+    const classification = classifyEngineError(error);
+    try { opts.onEvent?.({ type: "error", runId: opts.runId, threadId: opts.threadId, provider: "claude-code",
+      timestamp: Date.now(), message: detail, error: detail, ...classification }); } catch {}
+    return { status: "failed", stopReason: "error", error: detail, ...classification };
+  });
+  return {
+    result,
+    closed: result.then(() => handle?.closed),
+    async cancel() { cancelled = true; if (handle) await handle.cancel(); },
+    async forceKill() { cancelled = true; if (handle) await handle.forceKill(); },
+    async steer(text) { return handle ? handle.steer(text) : { supported: false }; },
+    async respondPermission(id, decision) { return handle?.respondPermission(id, decision); },
+    async respondQuestion(id, answers) { return handle?.respondQuestion(id, answers); },
+  };
+}
+
+function startClaudeTurn({ runId, threadId, model, effort, cwd, nativeSessionId, ephemeral, prompt,
+  freshSessionPrompt, onEvent, onPermissionRequest, onQuestionRequest }, bin, mode, strictSupported) {
   const args = buildClaudeArgs({ prefixArgs: bin.prefixArgs, mode, model, effort, nativeSessionId, ephemeral });
-  const isolateMcp = inheritHostMcp !== true && options?.inheritHostMcp !== true && params?.inheritHostMcp !== true;
-  const strictSupported = isolateMcp && (strictMcpSupport
-    ? strictMcpSupport(bin)
-    : probeStrictMcpFlag(bin.command, bin.prefixArgs || [], bin.resolvedPath || bin.command));
-  if (isolateMcp && strictSupported && !args.includes("--strict-mcp-config")) args.push("--strict-mcp-config");
+  if (strictSupported && !args.includes("--strict-mcp-config")) args.push("--strict-mcp-config");
   const processGroup = process.platform !== "win32";
   const proc = spawnNoWindow(bin.command, args, {
-    cwd: nativePath(cwd || process.env.AGENT_TOWER_DEFAULT_ROOT || ensureMainRoot()),
+    cwd,
     env: buildCleanChildEnv(bin.env), stdio: ["pipe", "pipe", "pipe"], detached: processGroup,
   });
   const emit = event => { try { onEvent?.({ runId, threadId, provider: "claude-code", timestamp: Date.now(), ...event }); } catch {} };
@@ -400,7 +419,7 @@ export function runClaudeTurn({ runId, threadId, model, effort, permissionMode, 
     await result;
   })();
   return {
-    result, cancel, forceKill,
+    result, closed: result.then(() => {}, () => {}), cancel, forceKill,
     async steer(text) {
       if (cancelRequested || !stdinWritable()) return { supported: false };
       return writeFrame(userFrame(text)) ? { supported: true } : { supported: false };

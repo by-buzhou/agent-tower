@@ -86,7 +86,7 @@ const SPEC_SELECTION_PROPERTIES = {
 };
 
 const SESSION_REPORT_PROPERTIES = {
-  inheritHostMcp: { type: "boolean", description: "Claude CLI 显式继承宿主 MCP 配置。" },
+  inheritHostMcp: { type: "boolean", description: "允许本轮外部引擎继承宿主 MCP 配置，默认关闭。" },
   continueSession: {
     type: 'boolean',
     default: false,

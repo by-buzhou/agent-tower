@@ -141,6 +141,32 @@ export function createExecutionModule(ctx) {
       ...(curator ? { ...restrictions, role: "curator" } : {}),
       ...(staleHealth ? { meta: { health: { state: "healthy", runId, updatedAt: startedAt } } } : {}),
     });
+    const worktreeMs = typeof run.meta?.worktreeMs === "number" && Number.isFinite(run.meta.worktreeMs)
+      ? Math.max(0, Math.round(run.meta.worktreeMs))
+      : null;
+    const snapshotMs = typeof run.meta?.snapshotMs === "number" && Number.isFinite(run.meta.snapshotMs)
+      ? Math.max(0, Math.round(run.meta.snapshotMs))
+      : null;
+    const initialTimings = {
+      queueWaitMs: Math.max(0, startedAt - Number(run.createdAt || startedAt)),
+      worktreeMs,
+      snapshotMs,
+      prepMs: 0,
+      spawnMs: 0,
+      initHandshakeMs: null,
+      sessionBoundMs: null,
+      firstEventMs: null,
+      firstTextMs: null,
+      totalMs: 0,
+      planBytes: 0,
+      specBytes: 0,
+      effectivePromptBytes: Buffer.byteLength(String(effectivePrompt || ""), "utf8"),
+      specInlineCount: 0,
+      reusedSession: 0,
+      warmHit: 0,
+      budgetMode: "",
+      transport: "",
+    };
     const updatedRun = ctx.db.upsertRun({
       id: runId,
       threadId,
@@ -153,6 +179,8 @@ export function createExecutionModule(ctx) {
         title: updatedThread.title || "",
         taskId: updatedThread.taskId || "",
         usageReported: Boolean(run.meta?.usageReported),
+        preparationStage: "preparing",
+        timings: { ...(run.meta?.timings || {}), ...initialTimings },
       },
     });
 
@@ -166,21 +194,7 @@ export function createExecutionModule(ctx) {
       handle: null,
       steeringRestartPending: null,
       spawnStartedAt: null,
-      timings: {
-        queueWaitMs: Math.max(0, startedAt - Number(updatedRun.createdAt || startedAt)),
-        prepMs: 0,
-        spawnMs: 0,
-        sessionBoundMs: null,
-        firstEventMs: null,
-        firstTextMs: null,
-        totalMs: 0,
-        planBytes: 0,
-        specBytes: 0,
-        effectivePromptBytes: Buffer.byteLength(String(effectivePrompt || ""), "utf8"),
-        specInlineCount: 0,
-        reusedSession: 0,
-        transport: "",
-      },
+      timings: { ...initialTimings },
     };
     ctx.activeRuns.set(runId, runEntry);
     ctx.activeRunByThread.set(threadId, runId);
@@ -209,6 +223,15 @@ export function createExecutionModule(ctx) {
 
     const acceptsDriverEvents = () => !ctx.flags.dbClosed && !runEntry.retryPending && !runEntry.watchdogFailure &&
       !runEntry.cancelRequested && ctx.activeRuns.get(runId) === runEntry;
+    function persistLiveTimings() {
+      if (ctx.flags.dbClosed) return;
+      const cur = ctx.db.getRun(runId);
+      ctx.db.upsertRun({
+        id: runId,
+        threadId,
+        meta: { ...cur?.meta, preparationStage: runEntry.preparationStage, timings: { ...cur?.meta?.timings, ...runEntry.timings } },
+      });
+    }
     let handle, preparation;
     runEntry.prepStartedAt = Date.now();
     function launchPrepared(preloadedTop, preloadedMainDrafts) {
@@ -232,9 +255,11 @@ export function createExecutionModule(ctx) {
         expectedSessionId, hideExternalSession: effectiveEphemeral, nativeReview, nativeHost, transport, dynamicPrompt: effectivePrompt,
         preloadedTop, preloadedMainDrafts, selectsPromptOnSend: launchDriver === launchTurn && ctx.engineManager.runTurn === builtInRunTurn });
       runEntry.timings.prepMs = Math.max(0, Date.now() - runEntry.prepStartedAt);
+      runEntry.timings.budgetMode = specTurn.budgetMode || "";
       runEntry.specTurn = specTurn;
       runEntry.timings.effectivePromptBytes = Buffer.byteLength(String(specTurn.deltaPrompt || ""), "utf8");
       runEntry.curation?.snapshot();
+      runEntry.preparationStage = "handshake";
       runEntry.spawnStartedAt = Date.now();
       const driver = launchDriver({
         runId,
@@ -259,21 +284,40 @@ export function createExecutionModule(ctx) {
         freshSessionPrompt: specTurn.freshSessionPrompt,
         ephemeral: effectiveEphemeral,
         onEvent(evt) {
+          if (evt.type === "engine_teardown") {
+            if (ctx.flags.dbClosed || runEntry.retryPending || !Number.isFinite(evt.teardownMs)) return;
+            runEntry.timings.teardownMs = Math.max(0, Math.round(evt.teardownMs));
+            if (ctx.activeRuns.get(runId) !== runEntry && ctx.db.getRun(runId)) {
+              ctx.db.upsertRun({ id: runId, threadId, meta: { timings: { teardownMs: runEntry.timings.teardownMs } } });
+            }
+            return;
+          }
           if (!acceptsDriverEvents()) return;
           const eventAt = Date.now();
+          let timingsChanged = false;
           if (runEntry.timings.firstEventMs === null) runEntry.timings.firstEventMs = Math.max(0, eventAt - runEntry.spawnStartedAt);
           if (evt.type === "session_bound") {
+            runEntry.preparationStage = null;
             if (runEntry.timings.sessionBoundMs === null) runEntry.timings.sessionBoundMs = Math.max(0, eventAt - runEntry.spawnStartedAt);
+            if (evt.warmHit !== undefined) runEntry.timings.warmHit = evt.warmHit ? 1 : 0;
+            if (typeof evt.initHandshakeMs === "number" && Number.isFinite(evt.initHandshakeMs)) {
+              runEntry.timings.initHandshakeMs = Math.max(0, Math.round(evt.initHandshakeMs));
+            }
             runEntry.timings.reusedSession = Number(evt.resumed ?? Boolean(expectedSessionId && expectedSessionId === evt.nativeSessionId));
             if (evt.resumed === false) runEntry.timings.effectivePromptBytes = Buffer.byteLength(String(specTurn.freshSessionPrompt || ""), "utf8");
+            persistLiveTimings();
+            timingsChanged = true;
           }
-          if (runEntry.timings.firstTextMs === null && ["message_delta", "assistant_message"].includes(evt.type) && (evt.delta || evt.text)) {
+          if (runEntry.timings.firstTextMs === null && ["message_delta", "assistant_delta", "assistant_message"].includes(evt.type) && (evt.delta || evt.text)) {
             runEntry.timings.firstTextMs = Math.max(0, eventAt - runEntry.spawnStartedAt);
+            persistLiveTimings();
+            timingsChanged = true;
           }
           ctx.watchdog.observe(runId, evt);
           specTurn.observe(evt);
           handleDriverEvent(updatedThread, updatedRun, evt, {
             attemptKey,
+            timings: timingsChanged ? { ...runEntry.timings } : undefined,
             reasoningItemId,
             messageItemId,
             todoItemId,
@@ -288,6 +332,7 @@ export function createExecutionModule(ctx) {
         },
       });
       runEntry.timings.spawnMs = Math.max(0, Date.now() - runEntry.spawnStartedAt);
+      persistLiveTimings();
       runEntry.handle = driver;
       state.managed = !driver.passiveHost;
       if (driver.retrySafe === false) state.hasSideEffects = true;
@@ -296,14 +341,33 @@ export function createExecutionModule(ctx) {
     try {
       if (cwdError) throw cwdError;
       const repoRoot = updatedThread.meta?.projectRoot || updatedThread.workspace || targetCwd;
-      if (path.relative(repoRoot, targetCwd) === "") {
+      const sameRoot = path.relative(repoRoot, targetCwd) === "";
+      const waitClosed = typeof ctx.engineManager?.waitForThreadClosed === "function"
+        ? ctx.engineManager.waitForThreadClosed.bind(ctx.engineManager)
+        : null;
+      if (sameRoot && !waitClosed) {
         handle = launchPrepared(targetCwd, "");
       } else {
         const readGit = (cwd, ...args) => runGit(["--no-optional-locks", ...args], { cwd }).then(r => r.stdout, () => null);
         preparation = (async () => {
-          const top = (await readGit(targetCwd, "rev-parse", "--show-toplevel"))?.trim() || targetCwd;
-          const drafts = !curator && ctx.db.isProjectSpecEnabled(repoRoot) && path.relative(top, repoRoot) ? await readGit(repoRoot, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--", ".agent-tower/spec") : "";
-          if (!acceptsDriverEvents() || ctx.flags.shuttingDown || ctx.scopePolicy.dispatchBypass({ threadId })) return { result: { status: "interrupted" } };
+          let top = targetCwd;
+          let drafts = "";
+          if (sameRoot) {
+            await waitClosed(threadId);
+          } else {
+            const [resolvedTop] = await Promise.all([
+              readGit(targetCwd, "rev-parse", "--show-toplevel").then(out => out?.trim() || targetCwd),
+              waitClosed ? waitClosed(threadId) : Promise.resolve(),
+            ]);
+            top = resolvedTop;
+            drafts = !curator && ctx.db.isProjectSpecEnabled(repoRoot) && path.relative(top, repoRoot)
+              ? await readGit(repoRoot, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--", ".agent-tower/spec")
+              : "";
+          }
+          if (!acceptsDriverEvents() || ctx.flags.shuttingDown ||
+              ctx.scopePolicy.dispatchBypass({ threadId, _manualCurationBypass: updatedRun.meta?.triggerSource === "manual" }, updatedThread)) {
+            return { result: { status: "interrupted" } };
+          }
           return launchPrepared(top, drafts);
         })();
         handle = { result: preparation.then(driver => driver.result) };
@@ -384,7 +448,8 @@ export function createExecutionModule(ctx) {
             threadId,
             runId,
             workspace: ws,
-            nativeSessionId: evt.nativeSessionId,
+            ...(itemIds.ephemeral ? {} : { nativeSessionId: evt.nativeSessionId }),
+            timings: itemIds.timings,
             resumed: evt.resumed ?? (evt.nativeSessionId === thread.nativeSessionId),
             ...(evt.effectiveModel ? { effectiveModel: evt.effectiveModel } : {}),
             ...(isNative ? { isNativeHost: true, hostConversationId: hostConvId } : {}),
@@ -448,6 +513,7 @@ export function createExecutionModule(ctx) {
           runId,
           workspace: ws,
           itemId: mItemId,
+          ...(itemIds.timings ? { timings: itemIds.timings } : {}),
           delta,
           phase: evt.phase || "final_answer",
         });
@@ -775,11 +841,24 @@ export function createExecutionModule(ctx) {
 
     const latestMeta = ctx.db.getRun(runId)?.meta || {};
     const injectedSpecs = latestMeta.injectedSpecs || {};
+    const resultWarmHit = result?.warmHit !== undefined ? (result.warmHit ? 1 : 0) : runEntry.timings.warmHit;
+    const resultInitHandshakeMs = typeof result?.initHandshakeMs === "number" && Number.isFinite(result.initHandshakeMs)
+      ? Math.max(0, Math.round(result.initHandshakeMs))
+      : runEntry.timings.initHandshakeMs;
+    const resultTeardownMs = typeof result?.teardownMs === "number" && Number.isFinite(result.teardownMs)
+      ? Math.max(0, Math.round(result.teardownMs))
+      : runEntry.timings.teardownMs;
     const timings = {
       ...runEntry.timings,
-      sessionBoundMs: runEntry.timings.sessionBoundMs ?? 0,
-      firstEventMs: runEntry.timings.firstEventMs ?? 0,
-      firstTextMs: runEntry.timings.firstTextMs ?? 0,
+      worktreeMs: runEntry.timings.worktreeMs ?? null,
+      snapshotMs: runEntry.timings.snapshotMs ?? null,
+      initHandshakeMs: resultInitHandshakeMs ?? null,
+      sessionBoundMs: runEntry.timings.sessionBoundMs ?? null,
+      firstEventMs: runEntry.timings.firstEventMs ?? null,
+      firstTextMs: runEntry.timings.firstTextMs ?? null,
+      ...(resultTeardownMs !== undefined ? { teardownMs: resultTeardownMs } : {}),
+      warmHit: Number(resultWarmHit) ? 1 : 0,
+      budgetMode: injectedSpecs.budgetMode || runEntry.timings.budgetMode || "",
       totalMs: durationMs,
       planBytes: injectedSpecs.planBytes || 0,
       specBytes: injectedSpecs.specBytes || 0,
@@ -798,6 +877,7 @@ export function createExecutionModule(ctx) {
         ...(result.code ? { errorCode: result.code } : {}),
         ...(result.effectiveModel ? { effectiveModel: result.effectiveModel } : {}),
         timings: { ...(latestMeta.timings || {}), ...timings },
+        preparationStage: null,
       },
       usage: usagePatch,
       durationMs,

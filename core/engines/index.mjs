@@ -37,6 +37,7 @@ import {
   runGenericCliTurn,
 } from "./generic-cli.mjs";
 import { runKimiTurn } from "./kimi-acp.mjs";
+import { createWarmPool } from "./warm-pool.mjs";
 import {
   detectCommandOnSystem,
   resolveAgyBinary,
@@ -103,8 +104,12 @@ export function createEngineManager({
   appDataDir,
   agentApiExe,
   getCustomProviders,
+  warmPoolOptions,
 } = {}) {
-  const activeHandles = new Map();
+  const activeHandles = new Set();
+  const closingHandles = new Set();
+  const warmPool = createWarmPool({ ...warmPoolOptions, pluginDataDir });
+  let shutdown;
   const activeWatchers = new Map();
 
   let currentHostEnv = {
@@ -113,14 +118,35 @@ export function createEngineManager({
   };
   let currentAppDataDir = appDataDir || null;
 
-  function registerHandle(key, handle) {
-    activeHandles.set(key, handle);
-    handle.result
-      .finally(() => {
-        activeHandles.delete(key);
-      })
-      .catch(() => {});
+  function registerHandle(handle, threadId, cwd) {
+    const entry = { handle, threadId, cwd };
+    activeHandles.add(entry);
+    closingHandles.add(entry);
+    const settled = () => { activeHandles.delete(entry); };
+    void handle.result.then(settled, settled);
+    handle.closed = Promise.resolve(handle.closed ?? handle.result).then(() => {}, () => {});
+    void handle.closed.then(() => { closingHandles.delete(entry); });
     return handle;
+  }
+
+  async function waitForClosed(matches, timeoutMs) {
+    const closing = [...closingHandles].filter(matches);
+    if (!closing.length) return;
+    let timer;
+    try {
+      await Promise.race([
+        Promise.all(closing.map(({ handle }) => handle.closed)),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(Object.assign(new Error("等待引擎释放会话或工作目录超时。"), {
+            code: "ENGINE_CLOSE_TIMEOUT",
+          })), timeoutMs);
+        }),
+      ]);
+    } finally { clearTimeout(timer); }
+  }
+
+  function assertRunning() {
+    if (shutdown) throw Object.assign(new Error("引擎管理器已进入关闭流程。"), { code: "ENGINE_MANAGER_SHUTDOWN" });
   }
 
   function resolveExtensionConfig(providerId, opts = {}) {
@@ -220,6 +246,7 @@ export function createEngineManager({
      * Launch or resume a turn on any built-in or extension engine with normalized streaming events.
      */
     runTurn(opts = {}) {
+      assertRunning();
       const {
         runId = `run_${crypto.randomUUID().slice(0, 8)}`,
         threadId = "",
@@ -265,6 +292,10 @@ export function createEngineManager({
         prompt,
         freshSessionPrompt: opts.freshSessionPrompt,
         ephemeral: Boolean(ephemeral),
+        asyncTeardown: opts.asyncTeardown ?? true,
+        inheritHostMcp: opts.inheritHostMcp === true,
+        mcpServers: opts.mcpServers,
+        resolveBinary: opts.resolveBinary,
         onEvent,
         onPermissionRequest,
         onQuestionRequest,
@@ -272,11 +303,11 @@ export function createEngineManager({
 
       let handle;
       if (provider === "kimi-code") {
-        handle = runKimiTurn(driverOpts);
+        handle = runKimiTurn({ ...driverOpts, warmPool });
       } else if (provider === "codex") {
-        handle = runCodexTurn(driverOpts);
+        handle = runCodexTurn({ ...driverOpts, warmPool });
       } else if (provider === "claude-code") {
-        handle = runClaudeTurn({ ...driverOpts, inheritHostMcp: opts.inheritHostMcp });
+        handle = runClaudeTurn(driverOpts);
       } else if (provider === "antigravity") {
         const mergedHostEnv = {
           ...currentHostEnv,
@@ -300,7 +331,7 @@ export function createEngineManager({
               code: "AGY_ACP_OAUTH_FORBIDDEN",
             });
           }
-          handle = runAgyTurn({ ...driverOpts, resolveBinary: opts.resolveBinary });
+          handle = runAgyTurn(driverOpts);
         } else {
           const effectiveAppDataDir =
             opts.appDataDir || currentAppDataDir || resolveDefaultAppDataDir(null, mergedHostEnv);
@@ -352,6 +383,7 @@ export function createEngineManager({
             steer: async () => ({ supported: false }),
             respondPermission: async () => {},
             respondQuestion: async () => {},
+            closed: Promise.resolve(),
             result: Promise.resolve({
               status: "failed",
               stopReason: "unsupported_provider",
@@ -364,7 +396,7 @@ export function createEngineManager({
         }
       }
 
-      return registerHandle(runId, handle);
+      return registerHandle(handle, threadId, cwd);
     },
 
     /**
@@ -507,9 +539,12 @@ export function createEngineManager({
      * Run non-interactive defect-first code review via Codex (`gpt-6-astra` by default).
      */
     runReview(opts = {}) {
-      const reviewKey = `review_${crypto.randomUUID().slice(0, 8)}`;
+      assertRunning();
+      const cwd = nativePath(opts.cwd || process.env.AGENT_TOWER_DEFAULT_ROOT || ensureMainRoot());
       const handle = runCodexReview({
-        cwd: nativePath(opts.cwd || process.env.AGENT_TOWER_DEFAULT_ROOT || ensureMainRoot()),
+        cwd,
+        inheritHostMcp: opts.inheritHostMcp === true,
+        resolveBinary: opts.resolveBinary,
         scope: opts.scope || "uncommitted",
         baseBranch: opts.baseBranch,
         commitSha: opts.commitSha,
@@ -517,9 +552,10 @@ export function createEngineManager({
         effort: isInheritedEffort(opts.effort) ? INHERIT_EFFORT : opts.effort,
         prompt: opts.prompt,
         ephemeral: opts.ephemeral !== undefined ? Boolean(opts.ephemeral) : true,
+        asyncTeardown: opts.asyncTeardown ?? true,
         onEvent: opts.onEvent,
       });
-      return registerHandle(reviewKey, handle);
+      return registerHandle(handle, opts.threadId, cwd);
     },
 
     /**
@@ -542,24 +578,48 @@ export function createEngineManager({
       return activeHandles.size;
     },
 
-    /**
-     * Force-stop all active engine child processes and close all native transcript watchers.
-     */
-    async shutdownAll() {
-      for (const [, watcher] of activeWatchers) {
-        try {
-          watcher.stop();
-        } catch {}
-      }
-      activeWatchers.clear();
+    drainWarmPool() {
+      return warmPool.drain();
+    },
 
-      const tasks = [];
-      for (const [, handle] of activeHandles) {
-        if (handle.detach) handle.detach();
-        else tasks.push(handle.forceKill().catch(() => {}));
-      }
-      activeHandles.clear();
-      await Promise.all(tasks);
+    waitForThreadClosed(threadId, timeoutMs = 5000) {
+      return waitForClosed(entry => Boolean(threadId) && entry.threadId === threadId, timeoutMs);
+    },
+
+    waitForPathClosed(targetPath, timeoutMs = 5000) {
+      if (!targetPath) return Promise.resolve();
+      const normalize = value => {
+        const absolute = path.resolve(nativePath(value));
+        return process.platform === "win32" ? absolute.toLowerCase() : absolute;
+      };
+      const root = normalize(targetPath);
+      return waitForClosed(({ cwd }) => {
+        const relative = path.relative(root, normalize(cwd));
+        return !relative || (relative !== ".." && !relative.startsWith(".." + path.sep) && !path.isAbsolute(relative));
+      }, timeoutMs);
+    },
+
+    /** Stop managed processes and wait until they have released their resources. */
+    shutdownAll() {
+      return shutdown ??= (async () => {
+        await warmPool.drain();
+        for (const watcher of activeWatchers.values()) {
+          try { watcher.stop(); } catch {}
+        }
+        activeWatchers.clear();
+        const detached = new Set();
+        await Promise.allSettled([...activeHandles].map(async ({ handle }) => {
+          if (handle.detach) {
+            detached.add(handle);
+            handle.detach();
+          } else {
+            await handle.forceKill();
+          }
+        }));
+        await Promise.all([...closingHandles].filter(({ handle }) => !detached.has(handle)).map(({ handle }) => handle.closed));
+        activeHandles.clear();
+        await warmPool.drain();
+      })();
     },
   };
 }

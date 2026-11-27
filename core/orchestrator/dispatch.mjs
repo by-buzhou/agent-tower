@@ -333,7 +333,10 @@ export function createDispatchModule(ctx) {
       () => delegateTaskCore({ ...params, role: "curator", _skipInferConversation: true }, undefined, { source, beforeStart }));
   }
 
-  async function createRequiredWorktree(options) {
+  async function createRequiredWorktree(options, rootConversationId) {
+    const phase = { type: "worktree_preparation", rootConversationId, threadId: options.threadId,
+      workspace: options.workspace, title: options.taskSlug };
+    ctx.context.emitEvent({ ...phase, active: true });
     try {
       return await createIsolatedWorktree(options);
     } catch (wtErr) {
@@ -343,6 +346,8 @@ export function createDispatchModule(ctx) {
       throw Object.assign(new Error(message, { cause: wtErr }), {
         code: typeof wtErr?.code === "string" && wtErr.code ? wtErr.code : "WORKTREE_CREATE_FAILED",
       });
+    } finally {
+      ctx.context.emitEvent({ ...phase, active: false });
     }
   }
 
@@ -402,8 +407,10 @@ export function createDispatchModule(ctx) {
 
     let effectiveIsolation = resolved.isolation;
     let worktreeInfo = null;
+    let worktreeMs = null;
     if (effectiveIsolation === "worktree") {
       threadId ||= makeId("thr");
+      const wtStart = Date.now();
       worktreeInfo = await createRequiredWorktree({
         cwd: baseWorkspace,
         workspace: repoRoot,
@@ -411,7 +418,8 @@ export function createDispatchModule(ctx) {
         taskSlug: title,
         branch: params.branch || params.workspaceStrategy?.branch,
         baseRef: params.baseRef || params.workspaceStrategy?.baseRef || "HEAD",
-      });
+      }, rootConversationId);
+      worktreeMs = Math.max(0, Date.now() - wtStart);
     }
 
     const afterWorktreeBypass = !curation && ctx.scopePolicy.dispatchBypass(params);
@@ -445,16 +453,19 @@ export function createDispatchModule(ctx) {
         if (worktreeInfo?.worktreePath && resolved.isolation !== "worktree") {
           await cleanupWorktree({ worktreePath: worktreeInfo.worktreePath, repoRoot, force: true }).catch(() => {});
           worktreeInfo = null;
+          worktreeMs = null;
         }
         effectiveIsolation = resolved.isolation;
       }
       if (effectiveIsolation === "worktree" && !worktreeInfo) {
         threadId ||= makeId("thr");
+        const wtStart = Date.now();
         worktreeInfo = await createRequiredWorktree({
           cwd: baseWorkspace, workspace: repoRoot, threadId, taskSlug: title,
           branch: params.branch || params.workspaceStrategy?.branch,
           baseRef: params.baseRef || params.workspaceStrategy?.baseRef || "HEAD",
-        });
+        }, rootConversationId);
+        worktreeMs = Math.max(0, Date.now() - wtStart);
       }
     } catch (error) {
       if (worktreeInfo?.worktreePath) await cleanupWorktree({ worktreePath: worktreeInfo.worktreePath, repoRoot, force: true }).catch(() => {});
@@ -565,7 +576,7 @@ export function createDispatchModule(ctx) {
       interactionMode: resolved.interactionMode,
       prompt: rawTask,
       inputIntent: "delegate",
-      meta: { taskId, title, ...resolved.routing, ...(params.inheritHostMcp === true ? { inheritHostMcp: true } : {}), ...specSelection(params), ...readPathsSelection(params), orchestrationMode, ...(orchestrationMode === "relay" ? { executionIntent } : {}) },
+      meta: { taskId, title, ...resolved.routing, ...(params.inheritHostMcp === true ? { inheritHostMcp: true } : {}), ...(worktreeMs !== null ? { worktreeMs } : {}), ...specSelection(params), ...readPathsSelection(params), orchestrationMode, ...(orchestrationMode === "relay" ? { executionIntent } : {}) },
       cwd: execCwd,
     });
 
@@ -830,7 +841,9 @@ export function createDispatchModule(ctx) {
 
     let effectiveIsolation = resolved.isolation;
     let worktreeInfo = null;
+    let worktreeMs = null;
     if (effectiveIsolation === "worktree") {
+      const wtStart = Date.now();
       worktreeInfo = await createRequiredWorktree({
         cwd: baseWorkspace,
         workspace: repoRoot,
@@ -838,7 +851,8 @@ export function createDispatchModule(ctx) {
         taskSlug: title,
         branch: params.branch || params.workspaceStrategy?.branch,
         baseRef: params.baseRef || params.workspaceStrategy?.baseRef || "HEAD",
-      });
+      }, launchRootConvId);
+      worktreeMs = Math.max(0, Date.now() - wtStart);
     }
 
     const afterWorktreeBypass = ctx.scopePolicy.dispatchBypass(params);
@@ -873,15 +887,18 @@ export function createDispatchModule(ctx) {
         if (worktreeInfo?.worktreePath && resolved.isolation !== "worktree") {
           await cleanupWorktree({ worktreePath: worktreeInfo.worktreePath, repoRoot, force: true }).catch(() => {});
           worktreeInfo = null;
+          worktreeMs = null;
         }
         effectiveIsolation = resolved.isolation;
       }
       if (effectiveIsolation === "worktree" && !worktreeInfo) {
+        const wtStart = Date.now();
         worktreeInfo = await createRequiredWorktree({
           cwd: baseWorkspace, workspace: repoRoot, threadId, taskSlug: title,
           branch: params.branch || params.workspaceStrategy?.branch,
           baseRef: params.baseRef || params.workspaceStrategy?.baseRef || "HEAD",
-        });
+        }, launchRootConvId);
+        worktreeMs = Math.max(0, Date.now() - wtStart);
       }
     } catch (error) {
       if (worktreeInfo?.worktreePath) await cleanupWorktree({ worktreePath: worktreeInfo.worktreePath, repoRoot, force: true }).catch(() => {});
@@ -976,7 +993,7 @@ export function createDispatchModule(ctx) {
         interactionMode: resolved.interactionMode,
         prompt: initialMessage,
         inputIntent: "initial",
-        meta: { ...resolved.routing, ...(params.inheritHostMcp === true ? { inheritHostMcp: true } : {}), ...specSelection(params), ...readPathsSelection(params), orchestrationMode, ...(orchestrationMode === "relay" ? { executionIntent } : {}) },
+        meta: { ...resolved.routing, ...(params.inheritHostMcp === true ? { inheritHostMcp: true } : {}), ...(worktreeMs !== null ? { worktreeMs } : {}), ...specSelection(params), ...readPathsSelection(params), orchestrationMode, ...(orchestrationMode === "relay" ? { executionIntent } : {}) },
         cwd: execCwd,
       });
 

@@ -1,19 +1,16 @@
 import { resolveSessionPrompt } from "../spec-context.mjs";
-import { PLUGIN_VERSION } from "../daemon-client.mjs";
+import { classifyAcpError, closeAcpSession, initializeAcp, resumeOrCreateAcpSession } from "./acp-protocol.mjs";
 import { nativePath, ensureMainRoot } from "../storage-paths.mjs";
 import * as crypto from "node:crypto";
 import { assertAgySubagentModel, canonicalAgyModelSlug, isAgyOrchestratorModel, assertReadOnlySupport, isInheritedModel, isInheritedEffort, normalizeEffortForTarget, normalizePermissionModeForProvider, splitAgyModelVariant } from "../catalog.mjs";
 import {
-  spawnNoWindow,
+  settleTurnWithClose,
+  startRpcProcess,
   buildCleanChildEnv,
-  classifyEngineError,
-  createNdjsonRpcConnection,
-  forceKillProcessTree,
   flattenAcpOptions,
   gracefulCancelWithEscalation,
   mapAcpPermissionOutcome,
   resolveAgyBinary,
-  resumeOrCreateAcpSession,
 } from "./proc-utils.mjs";
 
 /**
@@ -49,6 +46,10 @@ export function runAgyTurn({
   interactionMode = "default",
   cwd,
   nativeSessionId,
+  ephemeral = false,
+  asyncTeardown = true,
+  inheritHostMcp = false,
+  mcpServers,
   prompt,
   freshSessionPrompt,
   onEvent,
@@ -69,13 +70,11 @@ export function runAgyTurn({
     acpArgs.push("--dangerously-skip-permissions");
   }
 
-  const proc = spawnNoWindow(bin.command, acpArgs, {
-    cwd,
-    stdio: ["pipe", "pipe", "pipe"],
-
-    env: buildCleanChildEnv({ ...bin.env, AGENT_TOWER_MANAGED_AGY_ACP: "1" }),
-
+  const { proc, rpc, close, kill } = startRpcProcess(bin.command, acpArgs, {
+    cwd, env: buildCleanChildEnv({ ...bin.env, AGENT_TOWER_MANAGED_AGY_ACP: "1" }),
   });
+  if (ephemeral) nativeSessionId = undefined;
+  let initialized, initHandshakeMs;
 
   let settled = false;
   let cancelRequested = false;
@@ -143,12 +142,13 @@ export function runAgyTurn({
   };
 
   let promptSent = false;
-  const rpc = createNdjsonRpcConnection(proc, {
+  rpc.setHandlers({
     onStderr(chunk) {
       stderrTail = (stderrTail + chunk).slice(-2000);
     },
     onNotification(method, params) {
-      if (method !== "session/update" || !params?.update) return;
+      if (settled || method !== "session/update" || !params?.update ||
+          (params.sessionId && params.sessionId !== boundSessionId)) return;
       promptTimers?.touch();
       const u = params.update;
       if (!promptSent && u.sessionUpdate !== "session_info_update") return;
@@ -244,6 +244,7 @@ export function runAgyTurn({
     },
     async onServerRequest(method, params, rpcId) {
       if (method === "session/request_permission") {
+        if (settled || (params?.sessionId && params.sessionId !== boundSessionId)) return { outcome: { outcome: "cancelled" } };
         const options = Array.isArray(params?.options) ? params.options : [];
         if (skipPermissionsFlag) return { outcome: mapAcpPermissionOutcome("allow", options) };
         if (!onPermissionRequest) return { outcome: mapAcpPermissionOutcome(undefined, options) };
@@ -291,46 +292,21 @@ export function runAgyTurn({
   };
   signal?.addEventListener("abort", abort, { once: true });
 
-  const cleanupProcess = async () => {
-    signal?.removeEventListener("abort", abort);
-    for (const resolve of pendingPermissions.values()) resolve("cancel");
-    if (boundSessionId) await rpc.request("session/close", { sessionId: boundSessionId }, 1000).catch(() => {});
-    rpc.closeStdin();
-    if (proc.exitCode === null) {
-      await Promise.race([
-        new Promise((r) => proc.once("exit", r)),
-        new Promise((r) => setTimeout(r, 350)),
-      ]);
-      if (proc.exitCode === null) {
-        await forceKillProcessTree(proc);
-      }
-    }
-    rpc.dispose();
-  };
-
-  const result = (async () => {
+  const rawResult = (async () => {
     try {
-      await rpc.request(
-        "initialize",
-        {
-          protocolVersion: 1,
-          clientInfo: { name: "agent-tower", version: PLUGIN_VERSION },
-          clientCapabilities: {
-            fs: { readTextFile: false, writeTextFile: false },
-            terminal: false,
-          },
-        },
-        20000
-      );
-
-      // Only a clearly missing session may fork a new context; transient resume failures surface as errors.
-      const opened = await resumeOrCreateAcpSession(rpc, { nativeSessionId, cwd, resumeTimeoutMs: 15000, newTimeoutMs: 15000,
-        methods: ["session/resume", "session/load"] });
+      const started = performance.now();
+      initialized = await initializeAcp(rpc);
+      initHandshakeMs = Math.round(performance.now() - started);
+      const opened = await resumeOrCreateAcpSession(rpc, {
+        nativeSessionId, cwd, capabilities: initialized.capabilities,
+        mcpServers: inheritHostMcp === true ? mcpServers : undefined,
+      });
       boundSessionId = opened.sessionId;
       const sessionData = opened.sessionData;
 
       emit({
         type: "session_bound",
+        initHandshakeMs,
         nativeSessionId: boundSessionId,
         sessionId: boundSessionId,
         resumed: opened.resumed && boundSessionId === nativeSessionId,
@@ -401,11 +377,10 @@ export function runAgyTurn({
 
       if (cancelRequested) {
         settled = true;
-        await cleanupProcess();
         return {
           status: "interrupted",
           stopReason: "cancelled",
-          nativeSessionId: boundSessionId,
+          nativeSessionId: ephemeral ? undefined : boundSessionId,
           assistantText,
           reasoningText,
           usage,
@@ -418,8 +393,6 @@ export function runAgyTurn({
         sessionId: boundSessionId,
         prompt: [{ type: "text", text: resolveSessionPrompt(prompt, freshSessionPrompt, opened.resumed && boundSessionId === nativeSessionId) }],
       });
-
-      await new Promise((r) => setTimeout(r, 100));
 
       if (promptRes?.usage) {
         const u = promptRes.usage;
@@ -440,7 +413,6 @@ export function runAgyTurn({
       }
 
       settled = true;
-      await cleanupProcess();
 
       const stopReason = promptRes?.stopReason || "end_turn";
       const isCancelled = cancelRequested || stopReason === "cancelled";
@@ -449,51 +421,58 @@ export function runAgyTurn({
         status: isCancelled ? "interrupted" : "completed",
         effectiveModel,
         stopReason,
-        nativeSessionId: boundSessionId,
+        nativeSessionId: ephemeral ? undefined : boundSessionId,
         assistantText,
         reasoningText,
         usage,
       };
     } catch (err) {
       settled = true;
-      await cleanupProcess();
 
       if (cancelRequested) {
         return {
           status: "interrupted",
           stopReason: "cancelled",
-          nativeSessionId: boundSessionId || nativeSessionId || undefined,
+          nativeSessionId: ephemeral ? undefined : boundSessionId || nativeSessionId || undefined,
           assistantText,
           reasoningText,
           usage,
         };
       }
 
-      const errMsg = err?.message || String(err);
       const classification = ["MODEL_UNAVAILABLE", "UNSUPPORTED_AGY_MODEL"].includes(err?.code)
-        ? { code: err.code, category: "validation_error", isRetryable: false } : classifyEngineError(err, err?.rpcCode);
+        ? { error: err.message, code: err.code, category: "validation_error", isRetryable: false }
+        : classifyAcpError(err, initialized, "agy");
       emit({
         type: "error",
-        message: errMsg,
-        error: errMsg,
+        message: classification.error,
         ...classification,
       });
 
       return {
         status: "failed",
         stopReason: "error",
-        nativeSessionId: boundSessionId || nativeSessionId || undefined,
+        nativeSessionId: ephemeral ? undefined : boundSessionId || nativeSessionId || undefined,
         assistantText,
         reasoningText,
         usage,
-        error: errMsg,
         ...classification,
       };
+    } finally {
+      settled = true;
     }
-  })();
+  })().then(value => initHandshakeMs === undefined ? value : { ...value, initHandshakeMs });
+
+  const { result, closed } = settleTurnWithClose(rawResult, async () => {
+    signal?.removeEventListener("abort", abort);
+    for (const resolve of pendingPermissions.values()) resolve("cancel");
+    try { await closeAcpSession(rpc, boundSessionId, initialized?.capabilities, ephemeral, 1000); }
+    finally { await close(); }
+  }, emit, asyncTeardown);
 
   return {
     async cancel() {
+      if (settled) return;
       cancelRequested = true;
       await gracefulCancelWithEscalation(
         proc,
@@ -503,14 +482,15 @@ export function runAgyTurn({
           }
         },
         () => settled,
-        2000
+        2000,
+        kill
       );
     },
     async forceKill() {
       cancelRequested = true;
       for (const [, res] of pendingPermissions) res("cancel");
       pendingPermissions.clear();
-      await forceKillProcessTree(proc);
+      await kill();
     },
     async steer(_text) {
       return { supported: false };
@@ -521,5 +501,6 @@ export function runAgyTurn({
     },
     async respondQuestion(_reqId, _answers) {},
     result,
+    closed,
   };
 }

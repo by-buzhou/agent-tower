@@ -1,34 +1,21 @@
 import { resolveSessionPrompt } from "../spec-context.mjs";
-import { PLUGIN_VERSION } from "../daemon-client.mjs";
+import { classifyAcpError, closeAcpSession, extractAcpToolTextAndDiff, initializeAcp, resumeOrCreateAcpSession } from "./acp-protocol.mjs";
 import { nativePath, ensureMainRoot } from "../storage-paths.mjs";
 import { isInheritedEffort, isInheritedModel, normalizeEffortForTarget, normalizePermissionModeForProvider } from "../catalog.mjs";
 import * as crypto from "node:crypto";
 import {
-  spawnNoWindow,
+  settleTurnWithClose,
+  flattenAcpOptions,
+  startRpcProcess,
   buildCleanChildEnv,
-  classifyErrorCategory,
-  createNdjsonRpcConnection,
-  forceKillProcessTree,
   gracefulCancelWithEscalation,
   mapAcpPermissionOutcome,
   resolveExternalCommand,
-  resumeOrCreateAcpSession,
+  safeCatalogText,
   safeEngineError,
 } from "./proc-utils.mjs";
 
-export async function closeAcpSession(rpc, sessionId, capabilities, ephemeral, closeTimeoutMs) {
-  if (!sessionId) return;
-  const params = { sessionId };
-  if (ephemeral && capabilities?.sessionCapabilities?.delete) {
-    try {
-      await rpc.request("session/delete", params, 3000);
-      return;
-    } catch {}
-  }
-  try {
-    await rpc.request("session/close", params, closeTimeoutMs);
-  } catch {}
-}
+export { closeAcpSession } from "./acp-protocol.mjs";
 
 function parseArgsInput(args) {
   if (Array.isArray(args)) return args.map(String).filter(Boolean);
@@ -38,8 +25,34 @@ function parseArgsInput(args) {
   return [];
 }
 
+function flattenAcpConfigOptions(configOptions) {
+  return Array.isArray(configOptions) ? configOptions.filter(Boolean).map(option =>
+    Array.isArray(option.options) ? { ...option, options: flattenAcpOptions(option.options).filter(Boolean) } : option) : [];
+}
+
+function startAcpCommand(command, args, { cwd, env, candidatePaths, handlers }) {
+  const resolved = resolveExternalCommand(command, args, candidatePaths);
+  let diagnostic = "";
+  const child = startRpcProcess(resolved.command, resolved.args, { cwd, env: buildCleanChildEnv({ ...resolved.env, ...env }) });
+  child.rpc.setHandlers({ ...handlers, onStderr: chunk => { diagnostic = (diagnostic + chunk).slice(-8192); } });
+  return { ...child, binaryPath: resolved.resolvedPath || resolved.command, diagnostic: () => diagnostic };
+}
+
+async function negotiateAcp(id, args, start, options, cancelled = () => false) {
+  const child = start(args);
+  try { return await initializeAcp(child.rpc, options); }
+  catch (error) {
+    if (id !== "gemini-cli" || !args.includes("--acp") || args.includes("--experimental-acp") || cancelled() || error.code || error.rpcCode !== undefined) throw error;
+    await child.close(0);
+    const detail = child.diagnostic();
+    if (cancelled() || !/(?:unknown|unrecognized|unexpected|unsupported|invalid|no such)\s+(?:command|option|argument|flag)s?[^\r\n]*\b(?:--)?acp\b/i.test(detail)) throw error;
+    const fallback = start(args.map(arg => arg === "--acp" ? "--experimental-acp" : arg));
+    return initializeAcp(fallback.rpc, options);
+  }
+}
+
 function extractModelsAndOptionsFromAcpSession(sessionRes = {}, providerId = "custom-acp") {
-  const configOptions = Array.isArray(sessionRes.configOptions) ? sessionRes.configOptions : [];
+  const configOptions = flattenAcpConfigOptions(sessionRes.configOptions);
   const modelOpt = configOptions.find((o) => o?.id === "model" || o?.category === "model");
   const effortOpt = configOptions.find(
     (o) =>
@@ -52,7 +65,7 @@ function extractModelsAndOptionsFromAcpSession(sessionRes = {}, providerId = "cu
   const modeOpt = configOptions.find((o) => o?.id === "mode" || o?.category === "mode");
 
   const efforts = Array.isArray(effortOpt?.options)
-    ? effortOpt.options.map((o) => String(o.value ?? o.id)).filter(Boolean)
+    ? effortOpt.options.map(o => o?.value ?? o?.id).filter(value => typeof value === "string" && value)
     : ["low", "medium", "high"];
   const defaultEffort = effortOpt?.currentValue || efforts[Math.floor(efforts.length / 2)] || "high";
   const effortOptionId = effortOpt?.id || "thinking";
@@ -108,7 +121,10 @@ function extractModelsAndOptionsFromAcpSession(sessionRes = {}, providerId = "cu
       type: "select",
       role: "reasoning",
       currentValue: defaultEffort,
-      options: efforts.map((id) => ({ id, label: id })),
+      options: efforts.map(id => {
+        const option = effortOpt?.options?.find(o => (o?.value ?? o?.id) === id);
+        return { id, label: option?.name || option?.label || id };
+      }),
     });
   }
   if (modeDescriptors.length > 0) {
@@ -161,84 +177,27 @@ export async function probeAcpProvider({
   env = {},
   cwd,
   timeoutMs = 6000,
+  extraCandidatePaths,
 } = {}) {
   cwd = nativePath(cwd || process.env.AGENT_TOWER_DEFAULT_ROOT || ensureMainRoot());
   if (!command || !String(command).trim()) {
     return { ok: false, protocol: "acp", error: "未指定可执行命令 (command)" };
   }
 
-  const parsedArgs = parseArgsInput(args);
-  const resolved = resolveExternalCommand(command, parsedArgs);
-  let proc;
+  let child, initialized;
+  const halfTimeout = Math.max(2500, Math.floor(Number(timeoutMs) || 6000));
+  const start = args => child = startAcpCommand(command, args, { cwd, env, candidatePaths: extraCandidatePaths });
   try {
-    proc = spawnNoWindow(resolved.command, resolved.args, {
-      cwd,
-      stdio: ["pipe", "pipe", "pipe"],
-
-      env: buildCleanChildEnv({ ...resolved.env, ...(env || {}) }),
-    });
-  } catch (spawnErr) {
-    return { ok: false, protocol: "acp", error: `启动进程失败: ${spawnErr.message}` };
-  }
-
-  const rpc = createNdjsonRpcConnection(proc, {
-  });
-
-  const cleanup = async () => {
-    rpc.closeStdin();
-    if (proc.exitCode === null) {
-      await Promise.race([
-        new Promise((r) => proc.once("exit", r)),
-        new Promise((r) => setTimeout(r, 250)),
-      ]);
-      if (proc.exitCode === null) {
-        await forceKillProcessTree(proc);
-      }
-    }
-    rpc.dispose();
-  };
-
-  try {
-    const halfTimeout = Math.max(2500, Math.floor(Number(timeoutMs) || 6000));
-    const initRes = await rpc.request(
-      "initialize",
-      {
-        protocolVersion: 1,
-        clientInfo: { name: "agent-tower", version: PLUGIN_VERSION },
-        clientCapabilities: {
-          fs: { readTextFile: false, writeTextFile: false },
-          terminal: false,
-        },
-      },
-      halfTimeout
-    );
-
-    const sessionRes = await rpc.request(
-      "session/new",
-      { cwd, mcpServers: [] },
-      halfTimeout
-    );
-
-    const extracted = extractModelsAndOptionsFromAcpSession(sessionRes, id);
-
-    if (sessionRes?.sessionId) {
-      try {
-        await rpc.request("session/delete", { sessionId: sessionRes.sessionId }, 3000);
-      } catch {
-        try {
-          await rpc.request("session/close", { sessionId: sessionRes.sessionId }, 1000);
-        } catch {}
-      }
-    }
-
-    await cleanup();
-
+    initialized = await negotiateAcp(id, parseArgsInput(args), start, { timeoutMs: halfTimeout });
+    const session = await resumeOrCreateAcpSession(child.rpc, { cwd, newTimeoutMs: halfTimeout });
+    const extracted = extractModelsAndOptionsFromAcpSession(session.sessionData, id);
+    await closeAcpSession(child.rpc, session.sessionId, initialized.capabilities, true);
     return {
       ok: true,
       protocol: "acp",
-      binaryPath: resolved.resolvedPath || resolved.command,
-      agentInfo: initRes?.agentInfo || { name: String(command), version: "detected" },
-      capabilities: initRes?.agentCapabilities || {},
+      binaryPath: child.binaryPath,
+      agentInfo: initialized.agentInfo || { name: String(command), version: "detected" },
+      capabilities: initialized.capabilities || {},
       defaultModel: extracted.defaultModel,
       models: extracted.models,
       modes: extracted.modes,
@@ -246,15 +205,8 @@ export async function probeAcpProvider({
       effortOptionId: extracted.effortOptionId,
     };
   } catch (err) {
-    await cleanup();
-    const detail = safeEngineError(err);
-    return {
-      ok: false,
-      protocol: "acp",
-      binaryPath: resolved.resolvedPath || null,
-      error: detail,
-    };
-  }
+    return { ok: false, protocol: "acp", binaryPath: child?.binaryPath || null, ...classifyAcpError(err, initialized, command) };
+  } finally { await child?.close(); }
 }
 
 /** Generic ACP ladder (plan / default / auto / full-access); foreign "skip everything" values never unlock full access. */
@@ -308,6 +260,9 @@ export function runGenericAcpTurn({
   prompt = "",
   freshSessionPrompt,
   ephemeral = false,
+  asyncTeardown = true,
+  inheritHostMcp = false,
+  mcpServers = providerConfig.mcpServers,
   onEvent,
   onPermissionRequest,
   onQuestionRequest,
@@ -315,23 +270,15 @@ export function runGenericAcpTurn({
   cwd = nativePath(cwd || process.env.AGENT_TOWER_DEFAULT_ROOT || ensureMainRoot());
   const rawCommand = providerConfig.command || provider;
   const rawArgs = parseArgsInput(providerConfig.args ?? ["acp"]);
-  const resolved = resolveExternalCommand(rawCommand, rawArgs, providerConfig.candidatePaths || []);
-
-  const proc = spawnNoWindow(resolved.command, resolved.args, {
-    cwd,
-    stdio: ["pipe", "pipe", "pipe"],
-
-    env: buildCleanChildEnv({
-      ...resolved.env,
-      ...(providerConfig.env && typeof providerConfig.env === "object" ? providerConfig.env : {}),
-    }),
-  });
+  let child, rpc, initialized, initHandshakeMs;
+  let openedSession = false;
+  let configOptions;
+  let effectiveModel;
 
   let settled = false;
   let cancelRequested = false;
   const resumeSessionId = ephemeral ? undefined : nativeSessionId;
   let boundSessionId = resumeSessionId || "";
-  let agentCapabilities;
   let assistantText = "";
   let reasoningText = "";
   let usage = {
@@ -363,11 +310,24 @@ export function runGenericAcpTurn({
     } catch {}
   };
 
+  function reportEffectiveModel() {
+    const selected = safeCatalogText(configOptions?.find(o => o.id === "model" || o.category === "model")?.currentValue);
+    if (!selected || selected === effectiveModel) return;
+    effectiveModel = selected;
+    emit({ type: "effective_model", effectiveModel });
+  }
+
   let promptSent = false;
-  const rpc = createNdjsonRpcConnection(proc, {
+  const handlers = {
     onNotification(method, params) {
-      if (method !== "session/update" || !params?.update) return;
-      const u = params.update;
+      if (settled || (params?.sessionId && params.sessionId !== boundSessionId)) return;
+      const u = method === "session/update" ? params?.update : params;
+      if ((method === "config_option_update" || u?.sessionUpdate === "config_option_update") && Array.isArray(u?.configOptions)) {
+        configOptions = flattenAcpConfigOptions(u.configOptions);
+        if (promptSent) reportEffectiveModel();
+        return;
+      }
+      if (method !== "session/update" || !u) return;
       if (!promptSent && u.sessionUpdate !== "session_info_update") return;
       switch (u.sessionUpdate) {
         case "session_info_update": {
@@ -408,15 +368,8 @@ export function runGenericAcpTurn({
             locations: u.locations,
           };
 
-          let outStr = prev.output;
-          if (typeof u.rawOutput === "string") {
-            outStr = u.rawOutput;
-          } else if (Array.isArray(u.content)) {
-            const texts = u.content
-              .map((c) => (c?.type === "content" ? c.content?.text : c?.text) || "")
-              .filter(Boolean);
-            if (texts.length > 0) outStr = texts.join("\n");
-          }
+          const { text, diff } = extractAcpToolTextAndDiff(u.content);
+          const output = typeof u.rawOutput === "string" ? u.rawOutput : text || prev.output;
 
           const updated = {
             ...prev,
@@ -428,7 +381,8 @@ export function runGenericAcpTurn({
               ? { input: u.rawInput ?? u.args, rawInput: u.rawInput ?? u.args }
               : {}),
             ...(u.locations ? { locations: u.locations } : {}),
-            output: outStr,
+            output,
+            ...(diff ? { diff } : {}),
           };
           toolStates.set(id, updated);
           emit({ type: "tool_call", ...updated });
@@ -458,6 +412,7 @@ export function runGenericAcpTurn({
     },
     async onServerRequest(method, params, rpcId) {
       if (method === "session/request_permission") {
+        if (settled || (params?.sessionId && params.sessionId !== boundSessionId)) return { outcome: { outcome: "cancelled" } };
         const options = Array.isArray(params?.options) ? params.options : [];
         if (autoApprove) return { outcome: mapAcpPermissionOutcome("allow", options) };
         if (!onPermissionRequest) return { outcome: mapAcpPermissionOutcome(undefined, options) };
@@ -494,6 +449,7 @@ export function runGenericAcpTurn({
       }
 
       if (method === "elicitation/create") {
+        if (settled || (params?.sessionId && params.sessionId !== boundSessionId)) return { action: "decline" };
         if (!onQuestionRequest) return { action: "decline" };
         const reqId = `ques_${runId || provider}_${rpcId}_${crypto.randomUUID().slice(0, 8)}`;
         return new Promise((resolve) => {
@@ -524,53 +480,37 @@ export function runGenericAcpTurn({
       }
       return undefined;
     },
-  });
-
-  const cleanupProcess = async () => {
-    rpc.closeStdin();
-    if (proc.exitCode === null) {
-      await Promise.race([
-        new Promise((r) => proc.once("exit", r)),
-        new Promise((r) => setTimeout(r, 350)),
-      ]);
-      if (proc.exitCode === null) {
-        await forceKillProcessTree(proc);
-      }
-    }
-    rpc.dispose();
+  };
+  const start = args => {
+    child = startAcpCommand(rawCommand, args, {
+      cwd, env: providerConfig.env, candidatePaths: providerConfig.candidatePaths ?? providerConfig.extraCandidatePaths, handlers,
+    });
+    rpc = child.rpc;
+    return child;
   };
 
-  const result = (async () => {
+  const rawResult = (async () => {
     try {
-      const initialized = await rpc.request(
-        "initialize",
-        {
-          protocolVersion: 1,
-          clientInfo: { name: "agent-tower", version: PLUGIN_VERSION },
-          clientCapabilities: {
-            fs: { readTextFile: false, writeTextFile: false },
-            terminal: false,
-            elicitation: { form: true },
-          },
-        },
-        20000
-      );
-      agentCapabilities = initialized?.agentCapabilities;
-
-      // resume -> (unimplemented) load -> new only when the session is clearly gone; transient errors rethrow.
-      const opened = await resumeOrCreateAcpSession(rpc, { nativeSessionId: resumeSessionId, cwd, resumeTimeoutMs: 12000, newTimeoutMs: 15000 });
+      const started = performance.now();
+      initialized = await negotiateAcp(provider, rawArgs, start, { elicitation: true }, () => cancelRequested);
+      initHandshakeMs = Math.round(performance.now() - started);
+      const opened = await resumeOrCreateAcpSession(rpc, {
+        nativeSessionId: resumeSessionId, cwd, capabilities: initialized.capabilities,
+        mcpServers: inheritHostMcp === true ? mcpServers : undefined, resumeTimeoutMs: 12000,
+      });
+      openedSession = true;
       boundSessionId = opened.sessionId;
       const sessionRes = opened.sessionData;
 
       emit({
         type: "session_bound",
+        initHandshakeMs,
         nativeSessionId: boundSessionId,
         sessionId: boundSessionId,
         resumed: opened.resumed && boundSessionId === resumeSessionId,
       });
 
-      const meta = extractModelsAndOptionsFromAcpSession(sessionRes, provider);
-      let configOptions = meta.rawConfigOptions;
+      configOptions ??= flattenAcpConfigOptions(sessionRes.configOptions);
 
       // 1. Apply model selection (prefer configOption 'model', fallback 'session/set_model')
       if (model && !isInheritedModel(model)) {
@@ -579,12 +519,13 @@ export function runGenericAcpTurn({
         if (!modelApplied) {
           if (modelOpt?.id) {
             try {
+              const before = configOptions;
               const r = await rpc.request("session/set_config_option", {
                 sessionId: boundSessionId,
                 configId: modelOpt.id,
                 value: model,
               }, 5000);
-              if (Array.isArray(r?.configOptions)) configOptions = r.configOptions;
+              if (configOptions === before && Array.isArray(r?.configOptions)) configOptions = flattenAcpConfigOptions(r.configOptions);
               modelApplied = true;
             } catch {}
           }
@@ -615,7 +556,7 @@ export function runGenericAcpTurn({
             o?.category === "thought_level"
         );
         if (effOpt && Array.isArray(effOpt.options) && effOpt.options.length > 0) {
-          const allowed = effOpt.options.flatMap((o) => Array.isArray(o?.options) ? o.options : [o])
+          const allowed = effOpt.options
             .map((o) => o?.value ?? o?.id).filter((v) => typeof v === "string");
           const chosen = allowed.length ? normalizeEffortForTarget(provider, model, effort, allowed) : undefined;
           if (chosen && effOpt.currentValue !== chosen) {
@@ -631,6 +572,7 @@ export function runGenericAcpTurn({
       }
 
       // 3. Apply permission / plan mode
+      const meta = extractModelsAndOptionsFromAcpSession({ ...sessionRes, configOptions }, provider);
       const targetMode = mapGenericModeFromPermission(nativePermission, interactionMode, meta.modes);
       const modeOpt = configOptions.find((o) => o?.id === "mode" || o?.category === "mode");
       const currentMode = modeOpt?.currentValue || sessionRes.modes?.currentModeId;
@@ -665,13 +607,12 @@ export function runGenericAcpTurn({
         };
       }
 
+      reportEffectiveModel();
       promptSent = true;
       const promptRes = await rpc.request("session/prompt", {
         sessionId: boundSessionId,
         prompt: [{ type: "text", text: resolveSessionPrompt(prompt, freshSessionPrompt, opened.resumed && boundSessionId === resumeSessionId) }],
       });
-
-      await new Promise((r) => setTimeout(r, 100));
 
       if (promptRes?.usage) {
         const u = promptRes.usage;
@@ -693,6 +634,7 @@ export function runGenericAcpTurn({
         status: isCancelled ? "interrupted" : "completed",
         stopReason,
         nativeSessionId: ephemeral ? undefined : boundSessionId,
+        effectiveModel,
         assistantText,
         reasoningText,
         usage,
@@ -709,14 +651,8 @@ export function runGenericAcpTurn({
         };
       }
 
-      const fullError = safeEngineError(err);
-
-      emit({
-        type: "error",
-        message: fullError,
-        error: fullError,
-        category: classifyErrorCategory(fullError, err?.rpcCode),
-      });
+      const classification = classifyAcpError(err, initialized, rawCommand);
+      emit({ type: "error", message: classification.error, ...classification });
 
       return {
         status: "failed",
@@ -725,30 +661,35 @@ export function runGenericAcpTurn({
         assistantText,
         reasoningText,
         usage,
-        error: fullError,
+        ...classification,
       };
     } finally {
       settled = true;
-      try {
-        await closeAcpSession(rpc, boundSessionId, agentCapabilities, ephemeral, 1200);
-      } finally {
-        await cleanupProcess();
-      }
     }
-  })();
+  })().then(value => initHandshakeMs === undefined ? value : { ...value, initHandshakeMs });
+
+  const { result, closed } = settleTurnWithClose(rawResult, async () => {
+    for (const resolve of pendingPermissions.values()) resolve("cancel");
+    for (const resolve of pendingQuestions.values()) resolve({ cancelled: true });
+    try {
+      if (openedSession) await closeAcpSession(rpc, boundSessionId, initialized?.capabilities, ephemeral);
+    } finally { await child?.close(); }
+  }, emit, asyncTeardown);
 
   return {
     async cancel() {
+      if (settled || !child) return;
       cancelRequested = true;
       await gracefulCancelWithEscalation(
-        proc,
+        child.proc,
         async () => {
           if (boundSessionId) {
             rpc.notify("session/cancel", { sessionId: boundSessionId });
           }
         },
         () => settled,
-        2000
+        2000,
+        child.kill
       );
     },
     async forceKill() {
@@ -757,7 +698,7 @@ export function runGenericAcpTurn({
       pendingPermissions.clear();
       for (const [, res] of pendingQuestions) res({ cancelled: true });
       pendingQuestions.clear();
-      await forceKillProcessTree(proc);
+      await child?.kill();
     },
     async steer() {
       return { supported: false };
@@ -771,5 +712,6 @@ export function runGenericAcpTurn({
       if (r) r(answers);
     },
     result,
+    closed,
   };
 }

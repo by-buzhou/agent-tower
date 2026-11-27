@@ -232,7 +232,7 @@ for await (const line of readline.createInterface({ input: process.stdin })) {
   const { id, method } = JSON.parse(line);
   fs.appendFileSync(scenario + '.ndjson', JSON.stringify({ method }) + '\n');
   let result = {}, error;
-  if (method === 'initialize') result = { protocolVersion: 1 };
+  if (method === 'initialize') result = { protocolVersion: 1, agentCapabilities: { loadSession: true, sessionCapabilities: { resume: {} } } };
   if (method === 'session/resume') {
     if (scenario.endsWith('missing')) error = { code: -32603, message: 'Session not found: old-session' };
     else if (scenario.endsWith('transient')) error = { code: -32603, message: 'Internal error' };
@@ -254,10 +254,11 @@ const acpCalls = (dir, scenario) => fs.readFileSync(path.join(dir, scenario + ".
 test("Kimi and generic ACP resume only fork a new session when the old one is gone", () => withProjectSandbox("acp-resume", async dir => {
   const script = path.join(dir, "acp-fixture.mjs");
   fs.writeFileSync(script, acpFixture);
-  const kimi = scenario => within(runKimiTurn({ cwd: dir, nativeSessionId: "old-session", prompt: "hi", permissionMode: "auto",
-    resolveBinary: () => ({ command: process.execPath, prefixArgs: [script, scenario] }) }).result, 8000, `kimi ${scenario}`);
-  const generic = scenario => within(runGenericAcpTurn({ cwd: dir, provider: "custom-acp", nativeSessionId: "old-session", prompt: "hi",
-    providerConfig: { command: script, args: [scenario] } }).result, 8000, `generic ${scenario}`);
+  const complete = async handle => { await within(handle.closed, 8000, "ACP cleanup"); return handle.result; };
+  const kimi = scenario => complete(runKimiTurn({ cwd: dir, nativeSessionId: "old-session", prompt: "hi", permissionMode: "auto",
+    resolveBinary: () => ({ command: process.execPath, prefixArgs: [script, scenario] }) }));
+  const generic = scenario => complete(runGenericAcpTurn({ cwd: dir, provider: "custom-acp", nativeSessionId: "old-session", prompt: "hi",
+    providerConfig: { command: script, args: [scenario] } }));
 
   let res = await kimi("kimi-missing");
   assert.equal(res.status, "completed");
@@ -342,5 +343,5 @@ for await (const line of readline.createInterface({ input: process.stdin })) {
     assert.equal(result.nativeSessionId, "old");
     assert.equal(result.code, "CODEX_ACTIVE_WRITER");
     assert.doesNotMatch(fs.readFileSync(path.join(dir, "calls.ndjson"), "utf8"), /thread\/start/);
-  } finally { await handle.cancel(); }
+  } finally { await handle.closed; }
 }));

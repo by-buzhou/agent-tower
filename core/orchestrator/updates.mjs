@@ -13,9 +13,11 @@ export function createUpdatesModule(ctx, options) {
   let activeWrites = 0;
   let activeSpecWrites = 0;
   let cutoverId;
+  let pendingDrain;
   function isUpdating() {
     if (cutoverId && readUpdateRecord(ctx.dataDir, "apply.lock")?.id !== cutoverId) {
       cutoverId = undefined;
+      pendingDrain = undefined;
       ctx.flags.quiescing = false;
     }
     return Boolean(ctx.flags.quiescing || hasUpdateProbation(ctx.dataDir));
@@ -79,8 +81,9 @@ export function createUpdatesModule(ctx, options) {
     }
   }
 
-  function prepareCutover() {
+  async function prepareCutover() {
     isUpdating();
+    if (pendingDrain) return pendingDrain;
     if (!ctx.flags.quiescing) {
       const busy = {
         activeRuns: ctx.activeRuns.size,
@@ -96,13 +99,23 @@ export function createUpdatesModule(ctx, options) {
       cutoverId = lock?.phase === "quiescing" ? lock.id : undefined;
       ctx.hostSync.stopNativeWatchers();
       ctx.specs.stopAutoCuration();
-      updater.schedule();
-      publish(updater.status());
+      const draining = Promise.resolve().then(() => ctx.engineManager?.drainWarmPool?.()).then(() => {
+        if (pendingDrain !== draining || !isUpdating()) return { ...updater.status(), quiescing: false };
+        updater.schedule();
+        publish(updater.status());
+        return { ...updater.status(), quiescing: true };
+      }).catch(error => {
+        if (pendingDrain === draining) releaseCutover();
+        throw error;
+      }).finally(() => { if (pendingDrain === draining) pendingDrain = undefined; });
+      pendingDrain = draining;
+      return draining;
     }
-    return { ...updater.status(), quiescing: true };
+    return { ...updater.status(), quiescing: ctx.flags.quiescing };
   }
 
   function releaseCutover() {
+    pendingDrain = undefined;
     ctx.flags.quiescing = false;
     cutoverId = undefined;
     updater.refresh();
@@ -125,6 +138,7 @@ export function createUpdatesModule(ctx, options) {
       case "commitWorker": {
         const lock = readUpdateRecord(ctx.dataDir, "apply.lock");
         if (!workerId || lock?.id !== workerId || lock.phase !== "quiescing" || !ctx.flags.quiescing) break;
+        if (pendingDrain) return { committed: false };
         if (readUpdateRecord(ctx.dataDir, "cancel.json")?.id === workerId) return { committed: false };
         // This RPC and cancelCutover run in the same daemon, so cancellation and commitment are serialized.
         writeUpdateRecord(ctx.dataDir, "apply.lock", { ...lock, phase: lock.mode === "apply" ? "applying" : "rolling_back" });

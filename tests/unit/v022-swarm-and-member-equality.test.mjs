@@ -88,7 +88,7 @@ test("native driver rejects an unbound session and standalone AGY uses the manag
     for await (const line of readline.createInterface({ input: process.stdin })) {
       const { id, method } = JSON.parse(line);
       const results = {
-        initialize: { protocolVersion: 1 },
+        initialize: { protocolVersion: 1, agentCapabilities: { sessionCapabilities: { resume: {} } } },
         "session/new": { sessionId: "fake-acp-session", configOptions: [{ id: "model", currentValue: "gemini-4-hydrogen" }] },
         "session/resume": { sessionId: "fake-acp-session", configOptions: [{ id: "model", currentValue: "gemini-4-hydrogen" }] },
         "session/load": { sessionId: "fake-acp-session", configOptions: [{ id: "model", currentValue: "gemini-4-hydrogen" }] },

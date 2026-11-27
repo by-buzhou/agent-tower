@@ -780,7 +780,8 @@ export function createQueriesModule(ctx) {
       tail: params.tail === true && !afterOrdinal,
     });
     const pendingRequests = ctx.db.listPendingRequests({ threadId: thread.id });
-    const recentRuns = ctx.db.listRuns({ threadId: thread.id, limit: 50, tail: true });
+    const recentRuns = ctx.db.listRuns({ threadId: thread.id, limit: 50, tail: true })
+      .map(run => ({ ...run, timings: run.meta?.timings || null, preparationStage: run.meta?.preparationStage || null }));
 
     return {
       thread,

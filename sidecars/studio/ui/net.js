@@ -275,4 +275,5 @@ export function showToast(message, kind = 'info') {
   el.textContent = message;
   box.appendChild(el);
   setTimeout(() => el.remove(), 3600);
+  return el;
 }

@@ -1227,12 +1227,45 @@ export function createSpecsModule(ctx) {
     return root;
   }
 
+  function resolveGitRootsFast(cwd) {
+    const ceiling = process.env.AGENT_TOWER_TEST_ROOT && path.resolve(process.env.AGENT_TOWER_TEST_ROOT);
+    for (let cur = cwd; cur !== ceiling; cur = path.dirname(cur)) {
+      const dotGit = path.join(cur, ".git");
+      const stat = fs.lstatSync(dotGit, { throwIfNoEntry: false });
+      if (stat) {
+        if (stat.isDirectory() && fs.existsSync(path.join(dotGit, "objects")) &&
+            fs.existsSync(path.join(dotGit, "refs")) && fs.existsSync(path.join(dotGit, "HEAD"))) {
+          return { top: cur, common: dotGit };
+        }
+        if (stat.isFile()) {
+          const marker = readSpecFile(dotGit)?.trim();
+          if (marker?.startsWith("gitdir: ")) {
+            const admin = path.resolve(cur, marker.slice(8));
+            const common = path.dirname(path.dirname(admin));
+            if (path.basename(path.dirname(admin)) === "worktrees" && path.basename(common) === ".git" &&
+                fs.existsSync(path.join(admin, "HEAD")) && fs.existsSync(path.join(common, "objects"))) {
+              const backlink = readSpecFile(path.join(admin, "gitdir"))?.trim();
+              const shared = readSpecFile(path.join(admin, "commondir"))?.trim();
+              if (backlink && shared && !path.relative(dotGit, path.resolve(admin, backlink)) &&
+                  !path.relative(common, path.resolve(admin, shared))) return { top: cur, common };
+            }
+          }
+        }
+        // Git decides nonstandard layouts and invalid markers, including separate git dirs.
+        const [top = "", common = ""] = (readOnlyGit(cwd,
+          ["rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir"]) || "").trim().split(/\r?\n/);
+        return { top, common };
+      }
+      if (path.dirname(cur) === cur) break;
+    }
+    return { top: "", common: "" };
+  }
+
   function checkoutRoots(params) {
     try {
       const workspace = params.workspace !== undefined ? validateRoot(params.workspace) : undefined;
       const cwd = params.cwd !== undefined ? validateRoot(params.cwd) : workspace || validateRoot(ctx.db.defaultStudioRoot);
-      const [top, common] = (readOnlyGit(cwd,
-        ["rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir"]) || "").trim().split(/\r?\n/);
+      const { top, common } = resolveGitRootsFast(cwd);
       const checkout = top && inspectProjectRoot(top, ctx.dataDir).root ? validateRoot(top) : cwd;
       const commonRoot = common && path.basename(common).toLowerCase() === ".git" ? path.dirname(common) : "";
       const repoRoot = commonRoot && inspectProjectRoot(commonRoot, ctx.dataDir).root ? validateRoot(commonRoot) : checkout;
@@ -1303,12 +1336,14 @@ export function createSpecsModule(ctx) {
     const curatedHead = curator && ctx.db.inspectProjectDb?.(repoRoot) ? (ctx.db.readSpecCuration(repoRoot).curatedHead || "") : "";
     const curatorContext = curator && !expectedSessionId ? buildCuratorSessionContext(repoRoot, rootConvId) : "";
     const specLimits = projectSpecLimits(repoRoot);
+    const orchestrationMode = run.meta?.orchestrationMode || thread.meta?.orchestrationMode ||
+      ctx.scopePolicy?.readConversationPolicy?.(ctx.scopePolicy.threadPolicyRoot(thread))?.orchestrationMode;
     const plans = assembleSpecPrompt({ inventory, cwd: top, repoRoot, role,
       rawPrompt: run.meta?.reviewSpec ? (run.meta.reviewSpec.customPrompt || "") : run.prompt,
       dynamicPrompt: buildDynamicPrompt({ prompt: dynamicPrompt ?? run.prompt,
-        orchestrationMode: run.meta?.orchestrationMode, executionIntent: run.meta?.executionIntent }),
+        orchestrationMode, executionIntent: run.meta?.executionIntent }),
       selection, review: run.meta?.reviewSpec, transport, ledger: previous, planDoc, controlDir: ctx.dataDir,
-      curatedHead, curatorContext, specLimits, specEnabled });
+      curatedHead, curatorContext, specLimits, specEnabled, orchestrationMode });
     if (isLocalContinuation && previous?.size) plans.full = plans.delta;
     let sent = plans.delta;
     let variantSelected = false;
@@ -1346,6 +1381,7 @@ export function createSpecsModule(ctx) {
       deltaPrompt: plans.delta.prompt,
       sessionPrompt: { forSession: choose, toString: () => choose(resumed) },
       freshSessionPrompt: plans.full.prompt,
+      budgetMode: plans.delta.meta?.budgetMode || "",
       observe(event) {
         if (event.type === "session_bound" && event.nativeSessionId) {
           nativeHost ||= Boolean(event.isNativeHost);

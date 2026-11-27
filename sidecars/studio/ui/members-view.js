@@ -8,7 +8,7 @@ import { STATUS_LABELS, actionableSpecProposal, currentSpecCuration, getEffectiv
 import { scheduleRender } from './render.js';
 import { armOrConfirm, copyPlainText, relayToHostConversation, rpcCall, showToast } from './net.js';
 import { agentPastelColor, groupThreadWorkOrders, shortMemberName, threadCancelCapability } from './normalize.js';
-import { cancelButtonLabel, engClass, formatEffortDisplay, formatModelDisplay, formatProviderBadge, formatThreadElapsed, renderRuntimeRequestCard, renderSpecBadgeHtml, renderThreadHealthBadgeHtml, renderThreadModeBadgesHtml, resolveInjectedSpecs } from './widgets.js';
+import { cancelButtonLabel, engClass, formatEffortDisplay, formatModelDisplay, formatProviderBadge, formatThreadElapsed, renderRunTimingsBarHtml, renderRuntimeRequestCard, renderSpecBadgeHtml, renderThreadHealthBadgeHtml, renderThreadModeBadgesHtml, resolveInjectedSpecs } from './widgets.js';
 import { syncComposerSelects } from './options.js';
 import { closeMemberDrawer, hasAnyActiveRun, hydrateThreadDetails, resetForConversation, UNBOUND_CONVERSATION_HINT } from './stream.js';
 
@@ -527,6 +527,21 @@ function reconcileDrawerBlocks(bodyEl, blocks) {
   for (const [key, child] of existing) if (!retained.has(key)) child.remove();
 }
 
+function resolveOrderRun(t, order) {
+  const latest = order?.runs?.at(-1);
+  if (order?.isCurrent && t.currentRun?.timings && order.runIds.includes(t.currentRun.id)) return t.currentRun;
+  return latest;
+}
+
+function renderOrderTimingsHtml(t, order, history = false) {
+  const run = resolveOrderRun(t, order);
+  if (!run) return '';
+  const live = !history && Boolean(order?.isCurrent) && isStatusActive(t?.status);
+  const hasText = [...order.conclusionItems, ...order.intermediateNotes].some(item => item.runId === run.id);
+  const hasTools = order.processItems.some(item => item.runId === run.id && ['command_execution', 'file_change', 'tool_call'].includes(item.type));
+  return renderRunTimingsBarHtml(run, { live, hasText, hasTools });
+}
+
 function renderPromptCardHtml(t, order, history = false) {
   const item = order.promptItem;
   if (!item) return '';
@@ -543,6 +558,7 @@ function renderPromptCardHtml(t, order, history = false) {
     <div class="markdown-prose">${renderMarkdownSafe(shown)}</div>
     ${longPrompt ? `<button type="button" class="ghost-xs-btn md-prompt-toggle" data-toggle-prompt="${escapeHtml(promptKey)}">${expanded ? '收起指令 ▴' : `展开完整指令（共 ${lines.length} 行） ▾`}</button>` : ''}
     ${renderSpecBadgeHtml(resolveInjectedSpecs(item, t), `md:${t.id}:${item.id}`)}
+    ${renderOrderTimingsHtml(t, order, history)}
   </div>`;
 }
 
@@ -637,6 +653,7 @@ const WORK_ORDER_DRAWER_PROCESS_TYPES = new Set(['reasoning', 'tool_call', 'comm
 
 function renderOrderMessagesHtml(t, order, mName, history = false, nextStartedAt = Infinity) {
   const prompt = renderPromptCardHtml(t, order, history);
+  const standaloneTimings = !order.promptItem ? renderOrderTimingsHtml(t, order, history) : '';
   const dispatches = renderCoordinatorDispatchesHtml(t, order, nextStartedAt, history);
   const trace = renderOrderTraceHtml(t, order, history);
   const steer = order.steerItems.map((item) => `<div class="md-item-card md-steer-card"><div class="md-card-meta">⚡ Steer 纠偏 · ${formatTimeShort(item.createdAt)}</div><div class="markdown-prose">${renderMarkdownSafe(item.text || '')}</div></div>`).join('');
@@ -645,7 +662,7 @@ function renderOrderMessagesHtml(t, order, mName, history = false, nextStartedAt
     ? '<div class="md-item-card md-live-placeholder">⏳ 正在执行，实时输出将在到达后显示在这里。</div>'
     : '';
   const errors = order.errorItems.map((item) => `<div class="error-inline-box">❌ ${escapeHtml(item.error || item.text || '执行异常')}</div>`).join('');
-  return prompt + dispatches + trace + steer + conclusions + running + errors;
+  return prompt + standaloneTimings + dispatches + trace + steer + conclusions + running + errors;
 }
 
 function renderHistoryOrdersHtml(t, historyOrders, mName, currentOrderStart = Infinity) {
@@ -746,7 +763,12 @@ export function renderMemberDrawer() {
         html: `<div class="md-current-order-head">当前工单 #${currentOrder.orderNo}${currentOrder.title ? ` · ${escapeHtml(currentOrder.title)}` : ''}</div>`,
       });
     }
-    if (currentOrder.promptItem) blocks.push({ key: `cur-prompt:${currentOrder.key}`, html: renderPromptCardHtml(t, currentOrder) });
+    if (currentOrder.promptItem) {
+      blocks.push({ key: `cur-prompt:${currentOrder.key}`, html: renderPromptCardHtml(t, currentOrder) });
+    } else {
+      const curTimingsHtml = renderOrderTimingsHtml(t, currentOrder, false);
+      if (curTimingsHtml) blocks.push({ key: `cur-timings:${currentOrder.key}`, html: curTimingsHtml });
+    }
     const coordDispHtml = renderCoordinatorDispatchesHtml(t, currentOrder, Infinity, false);
     if (coordDispHtml) blocks.push({ key: `cur-dispatches:${currentOrder.key}`, html: coordDispHtml });
     if (currentOrder.processItems.length || currentOrder.intermediateNotes.length) {

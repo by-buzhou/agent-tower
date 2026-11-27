@@ -1,6 +1,9 @@
 import { resolveSessionPrompt } from "../spec-context.mjs";
 import { PLUGIN_VERSION } from "../daemon-client.mjs";
 import { nativePath, ensureMainRoot } from "../storage-paths.mjs";
+import { readFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import * as crypto from "node:crypto";
 import * as readline from "node:readline";
 import { isInheritedEffort, isInheritedModel, normalizeEffortForTarget, normalizePermissionModeForProvider } from "../catalog.mjs";
@@ -8,7 +11,9 @@ import {
   spawnNoWindow,
   buildCleanChildEnv,
   classifyErrorCategory,
-  createNdjsonRpcConnection,
+  binaryFingerprint,
+  settleTurnWithClose,
+  startRpcProcess,
   forceKillProcessTree,
   gracefulCancelWithEscalation,
   resolveCodexBinary,
@@ -16,6 +21,86 @@ import {
   safeEngineError,
   isMissingSessionError,
 } from "./proc-utils.mjs";
+
+// Match TOML paths without splitting on dots or comments inside quoted keys.
+const tomlKey = /"(?:[^"\\]|\\.)*"|'[^']*'|[A-Za-z0-9_-]+/g;
+const tomlStringsAndComments = /#[^\r\n]*|"""(?:\\[\s\S]|"(?!"")|[^"\\])*"""{1,3}|'''[\s\S]*?'''|"(?:[^"\\\r\n]|\\.)*"|'[^'\r\n]*'/g;
+const tomlStatement = /^[ \t]*(?:\[{1,2}((?:[^\]"'\r\n]|"(?:[^"\\]|\\.)*"|'[^']*')+)\]{1,2}|((?:[\w.-]|[ \t]|"(?:[^"\\]|\\.)*"|'[^']*')+)[ \t]*=([^\r\n]*))/gm;
+
+function decodeTomlKey(key) {
+  if (key.startsWith("'")) return key.slice(1, -1);
+  if (!key.startsWith('"')) return key;
+  return JSON.parse(key.replace(/(\\\\)|\\U([0-9a-f]{8})/gi, (match, escaped, code) =>
+    escaped || JSON.stringify(String.fromCodePoint(parseInt(code, 16))).slice(1, -1)));
+}
+
+function readCodexMcpKeys(file) {
+  let text;
+  try { text = readFileSync(file, "utf8"); }
+  catch (error) {
+    if (["ENOENT", "ENOTDIR"].includes(error.code)) return [];
+    throw error;
+  }
+  const names = new Set();
+  let table = [];
+  let nesting = 0;
+  const structuralTokens = new RegExp(tomlStringsAndComments.source + "|[{}\\[\\]]|\\r?\\n", "g");
+  const statements = text.replace(structuralTokens, token => {
+    if (token.startsWith("#")) return "";
+    if (token.startsWith('"""') || token.startsWith("'''")) return '""';
+    if (token === "[" || token === "{") nesting++;
+    if (token === "]" || token === "}") nesting--;
+    return nesting && token.endsWith("\n") ? " " : token;
+  });
+  for (const [, header, assignment, value] of statements.matchAll(tomlStatement)) {
+    const keys = Array.from((header ?? assignment).matchAll(tomlKey), match => decodeTomlKey(match[0]));
+    if (header !== undefined) table = keys;
+    const fullKey = header === undefined ? [...table, ...keys] : table;
+    if (fullKey[0] !== "mcp_servers") continue;
+    if (fullKey.length >= 2) names.add(fullKey[1]);
+    else if (value?.trimStart().startsWith("{")) {
+      // Inline server tables can contain their own nested tables, arrays, and quoted separators.
+      let depth = 0;
+      let pendingKey;
+      for (const [token] of value.matchAll(/"(?:[^"\\]|\\.)*"|'[^']*'|[A-Za-z0-9_-]+|[{}\[\]=,#]/g)) {
+        if (token === "#") break;
+        if (token === "{" || token === "[") depth++;
+        else if (token === "}" || token === "]") depth--;
+        else if (depth === 1 && token === ",") pendingKey = undefined;
+        else if (depth === 1 && token === "=" && pendingKey !== undefined) names.add(decodeTomlKey(pendingKey));
+        else if (depth === 1) pendingKey ??= token;
+      }
+    }
+  }
+  return [...names].sort();
+}
+
+function codexMcpIsolation(cwd, env, inheritHostMcp) {
+  const home = path.resolve(cwd, env.CODEX_HOME || path.join(os.homedir(), ".codex"));
+  if (inheritHostMcp === true) return { globalKeys: [], allKeys: [], eligible: true, key: JSON.stringify([home, "inherit"]) };
+  const globalKeys = readCodexMcpKeys(path.resolve(cwd, home, "config.toml"));
+  const projectKeys = readCodexMcpKeys(path.join(cwd, ".codex", "config.toml"));
+  const allKeys = [...new Set([...globalKeys, ...projectKeys])];
+  return { globalKeys, allKeys, eligible: allKeys.length === globalKeys.length, key: JSON.stringify([home, globalKeys]) };
+}
+
+function codexMcpArgs(keys) {
+  if (keys.some(key => !/^[A-Za-z0-9_-]+$/.test(key))) {
+    // Codex splits the CLI override path on every dot, even inside quotes.
+    // Quoted keys in the TOML value retain their identity during config merging.
+    const entries = keys.map(key => JSON.stringify(key).replaceAll("\x7f", "\\u007f") + "={enabled=false}");
+    return ["-c", "mcp_servers={" + entries.join(",") + "}"];
+  }
+  return keys.flatMap(key => ["-c", `mcp_servers.${key}.enabled=false`]);
+}
+
+async function initializeCodex(rpc) {
+  await rpc.request("initialize", {
+    clientInfo: { name: "agent-tower", version: PLUGIN_VERSION },
+    capabilities: { experimentalApi: true },
+  }, 20000);
+  if (!rpc.notify("initialized", {})) throw new Error("Codex app-server closed during initialization");
+}
 
 /**
  * Map a requested permission to Codex's native sandbox + approval policy:
@@ -176,22 +261,28 @@ export function runCodexTurn({
   prompt,
   freshSessionPrompt,
   ephemeral = false,
+  asyncTeardown = true,
+  inheritHostMcp = false,
+  warmPool,
   onEvent,
   onPermissionRequest,
   onQuestionRequest,
 }) {
   cwd = nativePath(cwd || process.env.AGENT_TOWER_DEFAULT_ROOT || ensureMainRoot());
   const bin = resolveBinary();
-  const proc = spawnNoWindow(
-    bin.command,
-    [...bin.prefixArgs, "app-server", "--listen", "stdio://"],
-    {
-      cwd,
-      stdio: ["pipe", "pipe", "pipe"],
-
-      env: buildCleanChildEnv(bin.env),
-    }
-  );
+  const env = buildCleanChildEnv(bin.env);
+  if (ephemeral) nativeSessionId = undefined;
+  const mcp = codexMcpIsolation(cwd, env, inheritHostMcp);
+  // Keep relative CODEX_HOME stable when the process starts in the neutral directory.
+  if (env.CODEX_HOME) env.CODEX_HOME = path.resolve(cwd, env.CODEX_HOME);
+  const start = (directory, keys) => startRpcProcess(bin.command,
+    [...(bin.prefixArgs || []), ...codexMcpArgs(keys), "app-server", "--listen", "stdio://"],
+    { cwd: directory, env });
+  const spare = warmPool?.acquire("codex", binaryFingerprint(bin), mcp.key,
+    directory => start(directory, mcp.globalKeys), initializeCodex, mcp.eligible);
+  const { proc, rpc, close, kill } = spare || start(cwd, mcp.allKeys);
+  let initHandshakeMs = spare?.initHandshakeMs;
+  const timing = () => ({ warmHit: Boolean(spare), ...(initHandshakeMs === undefined ? {} : { initHandshakeMs }) });
 
   let settled = false;
   let cancelRequested = false;
@@ -240,7 +331,7 @@ export function runCodexTurn({
   const autoApprove = sandbox === "danger-full-access";
   const reviewerOverride = approvalsReviewer ? { approvalsReviewer } : {};
 
-  const rpc = createNdjsonRpcConnection(proc, {
+  rpc.setHandlers({
     onNotification(method, params) {
       // Strictly ignore account/* notifications to guarantee zero PII/email handling
       if (!method || method.startsWith("account/")) return;
@@ -420,6 +511,7 @@ export function runCodexTurn({
       }
     },
     async onServerRequest(method, params, rpcId) {
+      if (settled || cancelRequested) return undefined;
       if (
         method === "item/commandExecution/requestApproval" ||
         method === "item/fileChange/requestApproval" ||
@@ -517,31 +609,13 @@ export function runCodexTurn({
     );
   });
 
-  const cleanupProcess = async () => {
-    rpc.closeStdin();
-    if (proc.exitCode === null) {
-      await Promise.race([
-        new Promise((r) => proc.once("exit", r)),
-        new Promise((r) => setTimeout(r, 350)),
-      ]);
-      if (proc.exitCode === null) {
-        await forceKillProcessTree(proc);
-      }
-    }
-    rpc.dispose();
-  };
-
-  const result = (async () => {
+  const rawResult = (async () => {
     try {
-      await rpc.request(
-        "initialize",
-        {
-          clientInfo: { name: "agent-tower", version: PLUGIN_VERSION },
-          capabilities: { experimentalApi: true },
-        },
-        20000
-      );
-      rpc.notify("initialized", {});
+      if (!spare) {
+        const started = performance.now();
+        await initializeCodex(rpc);
+        initHandshakeMs = Math.round(performance.now() - started);
+      }
 
       const modelOverride = model && !isInheritedModel(model) ? { model } : {};
       const effortOverride = effort && !isInheritedEffort(effort)
@@ -591,6 +665,7 @@ export function runCodexTurn({
 
       emit({
         type: "session_bound",
+        ...timing(),
         nativeSessionId: activeThreadId,
         sessionId: activeThreadId,
         resumed: resumed && activeThreadId === nativeSessionId,
@@ -599,7 +674,6 @@ export function runCodexTurn({
 
       if (cancelRequested) {
         settled = true;
-        await cleanupProcess();
         return {
           status: "interrupted",
           stopReason: "cancelled",
@@ -630,7 +704,6 @@ export function runCodexTurn({
 
       const finalTurn = await turnCompletedPromise;
       settled = true;
-      await cleanupProcess();
 
       // Fallback: if finalTurn carries summary items and assistantText was empty
       if (!assistantText.trim() && Array.isArray(finalTurn?.items)) {
@@ -677,7 +750,6 @@ export function runCodexTurn({
       };
     } catch (err) {
       settled = true;
-      await cleanupProcess();
 
       if (cancelRequested) {
         return {
@@ -712,7 +784,12 @@ export function runCodexTurn({
         ...(activeWriter ? { code: "CODEX_ACTIVE_WRITER" } : {}),
       };
     }
-  })();
+  })().then(value => ({ ...value, ...(ephemeral ? { nativeSessionId: undefined } : {}), ...timing() }));
+  const { result, closed } = settleTurnWithClose(rawResult, async () => {
+    for (const resolve of pendingPermissions.values()) resolve("cancel");
+    for (const resolve of pendingQuestions.values()) resolve({ cancelled: true });
+    await close();
+  }, emit, asyncTeardown);
 
   return {
     async cancel() {
@@ -729,7 +806,8 @@ export function runCodexTurn({
           }
         },
         () => settled,
-        2000
+        2000,
+        kill
       );
     },
     async forceKill() {
@@ -738,7 +816,7 @@ export function runCodexTurn({
       pendingPermissions.clear();
       for (const [, res] of pendingQuestions) res({ cancelled: true });
       pendingQuestions.clear();
-      await forceKillProcessTree(proc);
+      await kill();
     },
     async steer(text) {
       if (settled || !activeThreadId || !activeTurnId) {
@@ -768,6 +846,7 @@ export function runCodexTurn({
       if (resolver) resolver(answers);
     },
     result,
+    closed,
   };
 }
 
@@ -799,13 +878,15 @@ export function runCodexReview({
   effort,
   prompt,
   ephemeral = true,
+  asyncTeardown = true,
+  inheritHostMcp = false,
   onEvent,
   resolveBinary = resolveCodexBinary,
 } = {}) {
   cwd = nativePath(cwd || process.env.AGENT_TOWER_DEFAULT_ROOT || ensureMainRoot());
   const bin = resolveBinary();
   const args = [
-    ...bin.prefixArgs,
+    ...(bin.prefixArgs || []),
     "exec", "--sandbox", "read-only",
     "review",
     "--json",
@@ -838,11 +919,16 @@ export function runCodexReview({
   }
 
   // Must ignore stdin so `codex exec` never blocks waiting for piped stdin EOF!
+  const env = buildCleanChildEnv(bin.env);
+  const mcp = codexMcpIsolation(cwd, env, inheritHostMcp);
+  args.splice((bin.prefixArgs || []).length, 0, ...codexMcpArgs(mcp.allKeys));
+  const processGroup = process.platform !== "win32";
   const proc = spawnNoWindow(bin.command, args, {
     cwd,
+    detached: processGroup,
     stdio: ["ignore", "pipe", "pipe"],
 
-    env: buildCleanChildEnv(bin.env),
+    env,
   });
 
   let settled = false;
@@ -877,7 +963,7 @@ export function runCodexReview({
     stderrTail = (stderrTail + chunk.toString("utf-8")).slice(-2000);
   });
 
-  const result = (async () => {
+  const rawReviewResult = (async () => {
     try {
       const rl = readline.createInterface({ input: proc.stdout, crlfDelay: Infinity });
       for await (const line of rl) {
@@ -972,7 +1058,6 @@ export function runCodexReview({
       };
     } catch (err) {
       settled = true;
-      await forceKillProcessTree(proc);
       if (cancelRequested) {
         return { status: "interrupted", reviewText, findings: parseReviewFindings(reviewText), usage };
       }
@@ -982,17 +1067,25 @@ export function runCodexReview({
     }
   })();
 
+  const { result, closed } = settleTurnWithClose(rawReviewResult, async () => {
+    await forceKillProcessTree(proc, { processGroup });
+    await exit.catch(() => {});
+    proc.stdout.destroy();
+    proc.stderr.destroy();
+  }, emit, asyncTeardown);
+
   return {
     async cancel() {
       cancelRequested = true;
       if (!settled) {
-        await forceKillProcessTree(proc);
+        await forceKillProcessTree(proc, { processGroup });
       }
     },
     async forceKill() {
       cancelRequested = true;
-      await forceKillProcessTree(proc);
+      await forceKillProcessTree(proc, { processGroup });
     },
     result,
+    closed,
   };
 }

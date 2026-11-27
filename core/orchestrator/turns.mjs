@@ -201,7 +201,7 @@ export function createTurnsModule(ctx) {
       interactionMode,
       liveModes,
       executionIntent,
-      specIds, targetPaths, planPath, readPaths, reviewSpec,
+      specIds, targetPaths, planPath, readPaths, reviewSpec, snapshotMs,
       allowDisabledPreset = false,
       _manualCurationBypass = false,
     } = {}
@@ -310,7 +310,7 @@ export function createTurnsModule(ctx) {
       interactionMode: thread.interactionMode,
       prompt: String(message || "").trim(),
       inputIntent,
-      meta: { ...routing, ...specSelection({ specIds, targetPaths, planPath }), ...ctx.dispatch.readPathsSelection({ readPaths }), ...(reviewSpec ? { reviewSpec } : {}), ...(allowDisabledPreset && routing.temporaryOverride ? { temporaryOverride: true } : {}), ...(_manualCurationBypass ? { triggerSource: "manual" } : {}) },
+      meta: { ...routing, ...specSelection({ specIds, targetPaths, planPath }), ...ctx.dispatch.readPathsSelection({ readPaths }), ...(reviewSpec ? { reviewSpec } : {}), ...(typeof snapshotMs === "number" && Number.isFinite(snapshotMs) ? { snapshotMs } : {}), ...(allowDisabledPreset && routing.temporaryOverride ? { temporaryOverride: true } : {}), ...(_manualCurationBypass ? { triggerSource: "manual" } : {}) },
       cwd: thread.worktreePath || thread.cwd,
     });
 
@@ -365,7 +365,7 @@ export function createTurnsModule(ctx) {
       interactionMode: resolved.interactionMode,
       prompt: text,
       inputIntent: "queue",
-      meta: { ...resolved.routing, ...specSelection(params), ...ctx.dispatch.readPathsSelection(params), ...(params.reviewSpec ? { reviewSpec: params.reviewSpec } : {}), freshContext: Boolean(params.freshContext), executionIntent: resolved.routing?.executionIntent || params.executionIntent, ...(hasExplicitRoute(params) ? { nextPresetKey: resolved.nextPresetKey } : {}), ...(followThreadPreset ? { followThreadPreset: true } : {}), ...(resolved.routing?.temporaryOverride ? { temporaryOverride: true } : {}) },
+      meta: { ...resolved.routing, ...specSelection(params), ...ctx.dispatch.readPathsSelection(params), ...(params.reviewSpec ? { reviewSpec: params.reviewSpec } : {}), ...(typeof params.snapshotMs === "number" && Number.isFinite(params.snapshotMs) ? { snapshotMs: params.snapshotMs } : {}), freshContext: Boolean(params.freshContext), executionIntent: resolved.routing?.executionIntent || params.executionIntent, ...(hasExplicitRoute(params) ? { nextPresetKey: resolved.nextPresetKey } : {}), ...(followThreadPreset ? { followThreadPreset: true } : {}), ...(resolved.routing?.temporaryOverride ? { temporaryOverride: true } : {}) },
       cwd: thread.worktreePath || thread.cwd,
     });
     const queue = ctx.db.listQueuedRuns(thread.id);
@@ -513,6 +513,7 @@ export function createTurnsModule(ctx) {
           ...specSelection(params),
           ...ctx.dispatch.readPathsSelection(params),
           reviewSpec: params.reviewSpec,
+          snapshotMs: params.snapshotMs,
           allowDisabledPreset: params.allowDisabledPreset === true,
         },
       };
@@ -548,6 +549,7 @@ export function createTurnsModule(ctx) {
       ...specSelection(params),
       ...ctx.dispatch.readPathsSelection(params),
       reviewSpec: params.reviewSpec,
+      snapshotMs: params.snapshotMs,
       allowDisabledPreset: params.allowDisabledPreset === true,
       _manualCurationBypass: params._manualCurationBypass === true,
     });
@@ -871,13 +873,19 @@ export function createTurnsModule(ctx) {
       route.interactionMode ??= sourceRun?.interactionMode ?? thread.interactionMode;
     }
     const priorReview = sourceRun?.meta?.reviewSpec;
-    const reviewSpec = priorReview && await ctx.review.snapshotReview({ ...priorReview, customPrompt: params.prompt ?? priorReview.customPrompt }, thread.worktreePath || thread.cwd);
+    let snapshotMs = null;
+    let reviewSpec;
+    if (priorReview) {
+      const snapshotStartedAt = Date.now();
+      reviewSpec = await ctx.review.snapshotReview({ ...priorReview, customPrompt: params.prompt ?? priorReview.customPrompt }, thread.worktreePath || thread.cwd);
+      snapshotMs = Math.max(0, Date.now() - snapshotStartedAt);
+    }
     return sendToThread({ ...route, threadId: thread.id, message: promptToRetry, mode: "restart", wait: params.wait,
       freshContext: Boolean(params.freshContext), executionIntent: route.executionIntent,
       specIds: params.specIds ?? sourceRun?.meta?.specIds, targetPaths: params.targetPaths ?? sourceRun?.meta?.targetPaths,
       planPath: params.planPath ?? sourceRun?.meta?.planPath,
       readPaths: params.readPaths ?? sourceRun?.meta?.readPaths,
-      ...(reviewSpec ? { reviewSpec } : {}),
+      ...(reviewSpec ? { reviewSpec, snapshotMs } : {}),
       allowDisabledPreset: route.allowDisabledPreset });
   }
 

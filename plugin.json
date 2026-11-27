@@ -1,7 +1,7 @@
 {
   "name": "agent-tower",
   "displayName": "AgentTower",
-  "version": "0.3.3.2",
+  "version": "0.3.4",
   "description": "专为 Antigravity 打造的多 Agent 协作编程插件，充分发挥 Gemini 4 语言理解与表达优势，一站式完成多路派单、会审与审改。",
   "license": "AGPL-3.0-only",
   "logo": "assets/logo.svg",

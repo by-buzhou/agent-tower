@@ -199,8 +199,10 @@ test("agy rejects missing, rejected, downgraded and non-admitted default models 
   for (const [scenario, model, code] of [["missing", "gemini-4-unknown", "MODEL_UNAVAILABLE"], ["reject", "gemini-4-neon", "MODEL_UNAVAILABLE"],
     ["fallback", "gemini-4-neon", "MODEL_UNAVAILABLE"], ["inherit-claude", "inherit", "UNSUPPORTED_AGY_MODEL"]]) {
     const events = [];
-    const result = await runAgyTurn({ model, cwd: dir, resolveBinary: mockCli(dir, agyFixture, scenario),
-      prompt: "never sent", onEvent: event => events.push(event) }).result;
+    const handle = runAgyTurn({ model, cwd: dir, resolveBinary: mockCli(dir, agyFixture, scenario),
+      prompt: "never sent", onEvent: event => events.push(event) });
+    const result = await handle.result;
+    await handle.closed;
     assert.equal(result.status, "failed");
     assert.equal(result.code, code);
     assert.equal(calls(dir, scenario).filter(o => o.method === "session/prompt").length, 0);
@@ -208,8 +210,10 @@ test("agy rejects missing, rejected, downgraded and non-admitted default models 
     assert.ok(!events.some(event => event.type === "effective_model"));
   }
   const events = [];
-  const result = await runAgyTurn({ model: "Orchestrator (Neon)", cwd: dir, effort: "xhigh", resolveBinary: mockCli(dir, agyFixture, "ok"),
-    prompt: "only after model validation", onEvent: event => events.push(event) }).result;
+  const handle = runAgyTurn({ model: "Orchestrator (Neon)", cwd: dir, effort: "xhigh", resolveBinary: mockCli(dir, agyFixture, "ok"),
+    prompt: "only after model validation", onEvent: event => events.push(event) });
+  const result = await handle.result;
+  await handle.closed;
   assert.equal(result.status, "completed");
   assert.ok(events.some(e => e.type === "effective_model" && e.effectiveModel === "gemini-pro-orchestrator-neon"));
   assert.deepEqual(calls(dir, "ok").filter(o => o.method === "session/set_config_option").map(o => o.params.configId), ["model", "mode"]);
@@ -218,8 +222,10 @@ test("agy rejects missing, rejected, downgraded and non-admitted default models 
 
 test("AGY restores the requested default mode before sending a prompt", () => withProjectSandbox("agy-mode-restore", async dir => {
   for (const scenario of ["restore-default", "restore-default-rejected"]) {
-    const result = await runAgyTurn({ model: "gemini-4-neon", permissionMode: "default", cwd: dir,
-      resolveBinary: mockCli(dir, agyFixture, scenario), prompt: "only in default mode" }).result;
+    const handle = runAgyTurn({ model: "gemini-4-neon", permissionMode: "default", cwd: dir,
+      resolveBinary: mockCli(dir, agyFixture, scenario), prompt: "only in default mode" });
+    const result = await handle.result;
+    await handle.closed;
     const requests = calls(dir, scenario);
     assert.ok(requests.some(r => r.method === "session/set_config_option" && r.params.configId === "permission" && r.params.value === "default"));
     assert.equal(result.status, scenario.endsWith("rejected") ? "failed" : "completed");

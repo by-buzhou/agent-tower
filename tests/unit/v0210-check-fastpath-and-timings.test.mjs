@@ -149,11 +149,15 @@ test("C07/C11 评审快照不污染原任务，默认新会话、显式续聊、
     assert.equal(typeof fourth.reviewText, "string");
 
     const timings = tower.db.getRun(third.runId).meta.timings;
-    for (const key of ["queueWaitMs", "prepMs", "spawnMs", "sessionBoundMs", "firstEventMs", "firstTextMs", "totalMs",
-      "planBytes", "specBytes", "effectivePromptBytes", "specInlineCount", "reusedSession"]) {
+    for (const key of ["queueWaitMs", "snapshotMs", "prepMs", "spawnMs", "sessionBoundMs", "firstEventMs", "firstTextMs", "totalMs",
+      "planBytes", "specBytes", "effectivePromptBytes", "specInlineCount", "reusedSession", "warmHit"]) {
       assert.equal(typeof timings[key], "number", key);
       assert.ok(Number.isFinite(timings[key]), key);
     }
+    assert.equal(timings.worktreeMs, null);
+    assert.equal(timings.initHandshakeMs, null);
+    assert.equal(timings.warmHit, 0);
+    assert.equal(timings.budgetMode, "standard");
     assert.equal(timings.reusedSession, 1);
     assert.equal(tower.db.getRun(first.runId).meta.timings.reusedSession, 0);
     assert.ok(timings.effectivePromptBytes > 0);
@@ -161,8 +165,20 @@ test("C07/C11 评审快照不污染原任务，默认新会话、显式续聊、
     assert.ok(tower.db.getRun(third.runId).meta.injectedSpecs);
 
     write(cwd, "src/new-after-review.mjs", "export {};\n");
-    await tower.retryRun({ threadId: fourth.threadId, runId: fourth.runId, wait: true });
+    const retried = await tower.retryRun({ threadId: fourth.threadId, runId: fourth.runId, wait: true });
     assert.match(calls.at(-1).prompt, /src\/new-after-review\.mjs/);
+    assert.equal(typeof tower.db.getRun(retried.runId).meta.timings.snapshotMs, "number");
+
+    tower.engineManager.runTurn = () => ({
+      result: Promise.resolve({ status: "failed", error: "early failure before handshake" }),
+    });
+    const failed = await tower.delegateTask({ cwd, conversationId: "review-fail-timings", task: "fail early", mode: "wait" });
+    const failedTimings = tower.db.getRun(failed.runId).meta.timings;
+    assert.equal(failedTimings.sessionBoundMs, null, "未达成的握手阶段应保持 null 而非 0");
+    assert.equal(failedTimings.firstEventMs, null, "未达成的首事件阶段应保持 null 而非 0");
+    assert.equal(failedTimings.firstTextMs, null, "未达成的首字阶段应保持 null 而非 0");
+    assert.equal(failedTimings.worktreeMs, null);
+    assert.equal(failedTimings.snapshotMs, null);
 
     let nativePrompt = "";
     tower.engineManager.runReview = options => {

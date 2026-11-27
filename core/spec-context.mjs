@@ -489,7 +489,7 @@ function truncate(text, limit) {
   return Buffer.from(text).subarray(0, limit).toString("utf8").replace(/\uFFFD$/, "");
 }
 
-const tierRank = { summary: 1, pointer_degraded: 2, inline: 3 };
+const tierRank = { path: 0, summary: 1, pointer_degraded: 2, inline: 3 };
 const equivalentTier = (previous, tier) => tierRank[previous] >= tierRank[tier];
 const block = text => text.length ? `<agent_tower_specs v="1">\n${text.map(escapeBlock).join("\n\n")}\n</agent_tower_specs>\n\n` : "";
 
@@ -767,10 +767,12 @@ function buildFallbackRoutingCatalog(specs, roleName) {
   return [head, ...lines].join("\n");
 }
 
-export function assembleSpecPrompt({ inventory, cwd, repoRoot = cwd, role, rawPrompt, dynamicPrompt, selection, review, transport, ledger, planDoc, controlDir, curatedHead = "", curatorContext = "", specLimits, specEnabled = true }) {
+export function assembleSpecPrompt({ inventory, cwd, repoRoot = cwd, role, rawPrompt, dynamicPrompt, selection, review, transport, ledger, planDoc, controlDir, curatedHead = "", curatorContext = "", specLimits, specEnabled = true, orchestrationMode = "" }) {
   const limits = normalizeSpecQuotaLimits(specLimits);
   const roleName = normalizeSpecRole(role);
   const curate = roleName === "curator";
+  const relaySlim = !curate && orchestrationMode === "relay" && transport !== "argv";
+  const budgetMode = transport === "argv" ? "argv" : relaySlim ? "relay_slim" : "standard";
   const { specs, warnings: inventoryWarnings } = curate || !specEnabled ? { specs: [], warnings: [] } : inventory;
   if (curate) { ledger = undefined; selection = undefined; planDoc = null; }
   const warnings = [...inventoryWarnings];
@@ -809,7 +811,7 @@ export function assembleSpecPrompt({ inventory, cwd, repoRoot = cwd, role, rawPr
   const docs = projectDocFlags(cwd, repoRoot);
   const plugin = pluginSpec(roleName, { ...docs, specLimits: limits, specEnabled });
   // Per-task navigation never participates in spec/session deduplication.
-  const rows = curate ? [] : evolutionRows(cwd, repoRoot, docs.evolutionPath, target, rawPrompt);
+  const rows = curate || relaySlim ? [] : evolutionRows(cwd, repoRoot, docs.evolutionPath, target, rawPrompt);
   const stems = curate ? [] : quickTestStems(repoRoot, roleName, target, matched);
   const probe = curate && transport !== "argv" ? buildCuratorStaticProbe(repoRoot || cwd, { curatedHead, specLimits: limits }) : "";
   const extraCurator = curate && transport !== "argv" && curatorContext ? curatorContext.trim() : "";
@@ -842,7 +844,10 @@ export function assembleSpecPrompt({ inventory, cwd, repoRoot = cwd, role, rawPr
     const plan = assemblePlanPrompt({ cwd, repoRoot, planDoc: planDoc ?? null, role, ledger: previous, transport,
       remainingBytes: argv ? ARGV_BUDGET - argvReserve - (plugin && !pluginReused ? cost(plugin.body) : 0) - (disabledReceipts.length ? cost(disabledNotice) : 0) : undefined });
     issues.push(...plan.warnings);
-    let budget = argv ? Math.max(0, ARGV_BUDGET - argvReserve - bytes(plan.prompt)) : limits.totalMaxBytes;
+    let budget = argv
+      ? Math.max(0, ARGV_BUDGET - argvReserve - bytes(plan.prompt))
+      : (relaySlim ? Math.min(limits.totalMaxBytes, 4096) : limits.totalMaxBytes);
+    const summaryBudgetLimit = relaySlim ? 1536 : 4096;
     let argvCapped = false;
     function addArgvChunk(text) {
       const size = cost(text);
@@ -885,19 +890,20 @@ export function assembleSpecPrompt({ inventory, cwd, repoRoot = cwd, role, rawPr
       const header = `### ${key} — ${title} (${relPath})\n`;
       const inline = plugin ? entry.body : `${header}${entry.body}`;
       const weak = isWeak(reason);
-      const inlineBytes = argv ? cost(inline) : bytes(escapeBlock(inline));
-      const canInline = plugin || (!weak &&
+      const relayFuzzy = relaySlim && (!required || weak) && (reason === "tag" || reason === "text_path");
+      const inlineBytes = argv || relaySlim ? cost(inline) : bytes(escapeBlock(inline));
+      const canInline = plugin || (!weak && !relayFuzzy &&
         (required || reason === "explicit" || entry.draftOnly || entry.bytes <= limits.singleMaxBytes) && inlineBytes <= budget && !(required && argv));
       const needsPointer = !weak && required;
       let tier = canInline ? "inline" : needsPointer ? "pointer_degraded" : "summary";
       const old = previous?.get(key);
-      if (old?.sha256 === entry.sha256 && equivalentTier(old.tier, tier)) tier = "reused";
+      if (old?.sha256 === entry.sha256 && equivalentTier(old.tier, relayFuzzy ? "path" : tier)) tier = "reused";
       if (tier !== "reused") {
         let text;
         let summaryPathOnly = false;
         if (tier === "inline") {
           text = inline;
-          if (!argv) budget = Math.max(0, budget - inlineBytes);
+          if (!argv && !(relaySlim && plugin)) budget = Math.max(0, budget - inlineBytes);
         } else if (tier === "pointer_degraded") {
           const reference = entry.draftOnly ? path.join(repoRoot, relPath) : relPath;
           const pointer = `【必读规范】动工前请务必先完整读取 ${reference}`;
@@ -906,17 +912,18 @@ export function assembleSpecPrompt({ inventory, cwd, repoRoot = cwd, role, rawPr
           if (entry.draftOnly) {
             detail += "该主仓草稿无法在隔离工作树按相对路径读取。";
             text += "\n【告警】该主仓草稿无法在当前工作树读取。";
-            const excerpt = argv ? "" : truncate(entry.body, Math.min(1024, budget));
+            const excerpt = argv || relaySlim ? "" : truncate(entry.body, Math.min(1024, budget));
             if (excerpt) { text += `\n草稿片段：${excerpt}`; budget -= bytes(excerpt); }
           }
           if (argv && cost(text) > budget) text = pointer;
+          if (relaySlim) summaries.push({ slot: chunks.length, text, relPath: pointer, receipt: { key, sha256: entry.sha256, tier } });
           issues.push(warning("REQUIRED_BUDGET_DEGRADED", key, detail));
         } else {
           const conditional = weak && required ? "【若涉及此模块必读】" : "";
           const reference = entry.draftOnly ? path.join(repoRoot, relPath) : relPath;
           const pointer = `${conditional}${reference}`;
-          text = `${conditional}${header}${entry.summary}${entry.draftOnly ? `\n主仓路径：${reference}` : ""}`;
-          if (!argv) summaries.push({ slot: chunks.length, text, relPath: pointer, receipt: { key, sha256: entry.sha256, tier } });
+          text = relayFuzzy ? pointer : `${conditional}${header}${entry.summary}${entry.draftOnly ? `\n主仓路径：${reference}` : ""}`;
+          if (!argv) summaries.push({ slot: chunks.length, text, relPath: pointer, receipt: { key, sha256: entry.sha256, tier: relayFuzzy ? "path" : tier } });
           else if (cost(text) > budget) {
             text = pointer;
             summaryPathOnly = true;
@@ -927,7 +934,7 @@ export function assembleSpecPrompt({ inventory, cwd, repoRoot = cwd, role, rawPr
           else if (curate) throw Object.assign(new Error("argv 无法完整投递规范维护官角色卡"), { code: "CURATOR_ARGV_BUDGET_EXCEEDED" });
         } else {
           chunks.push(text);
-          if (tier !== "summary") delivered.push({ key, sha256: entry.sha256, tier });
+          if (tier !== "summary" && !(relaySlim && tier === "pointer_degraded")) delivered.push({ key, sha256: entry.sha256, tier });
         }
       }
       items.push({ key, id, title, kind, tier, required, reason, bytes: entry.bytes, sha: entry.sha256.slice(0, 8), relPath });
@@ -939,8 +946,10 @@ export function assembleSpecPrompt({ inventory, cwd, repoRoot = cwd, role, rawPr
       if (argvCapped) issues.push(warning("ARGV_BUDGET_CAPPED", "spec", "规范投递已达 argv 预算上限。"));
     }
     const pathBytes = summaries.reduce((sum, row) => sum + cost(row.relPath), 0);
-    const grouped = pathBytes > 4096;
-    let remaining = 4096 - (grouped ? cost(directoryHint) : pathBytes);
+    const grouped = pathBytes > summaryBudgetLimit;
+    const groupedHint = relaySlim && summaries.some(row => row.receipt.tier === "pointer_degraded")
+      ? "【必读规范】其余匹配项请从 .agent-tower/spec/INDEX.md 查阅。" : directoryHint;
+    let remaining = summaryBudgetLimit - (grouped ? cost(groupedHint) : pathBytes);
     let capped = false;
     for (const row of summaries) {
       const extra = cost(row.text) - (grouped ? 0 : cost(row.relPath));
@@ -953,8 +962,9 @@ export function assembleSpecPrompt({ inventory, cwd, repoRoot = cwd, role, rawPr
       }
     }
     if (capped) {
-      if (grouped) chunks.push(directoryHint);
-      issues.push(warning("SUMMARY_BUDGET_CAPPED", "spec", "摘要与路径总量已达 4 KiB 上限，其余项请按目录查阅。"));
+      if (grouped) chunks.push(groupedHint);
+      const capLabel = relaySlim ? "1.5 KiB" : "4 KiB";
+      issues.push(warning("SUMMARY_BUDGET_CAPPED", "spec", `摘要与路径总量已达 ${capLabel} 上限，其余项请按目录查阅。`));
     }
     if (specEnabled && !curate && !argv && plugin && matched.length === 0) {
       const catalogText = buildFallbackRoutingCatalog(specs, roleName);
@@ -975,7 +985,7 @@ export function assembleSpecPrompt({ inventory, cwd, repoRoot = cwd, role, rawPr
       throw Object.assign(new Error("argv 无法完整投递规范维护官角色卡及任务"), { code: "CURATOR_ARGV_BUDGET_EXCEEDED" });
     }
     return { prompt: `${plan.prompt}${specBlock}${sendPrompt}`, delivered: [...plan.delivered, ...delivered], meta: {
-      v: 1, planBytes: bytes(plan.prompt), specBytes: bytes(specBlock), deliveredCount: project.length - count("reused"), inlineCount: count("inline"), summaryCount: count("summary"),
+      v: 1, budgetMode, planBytes: bytes(plan.prompt), specBytes: bytes(specBlock), deliveredCount: project.length - count("reused"), inlineCount: count("inline"), summaryCount: count("summary"),
       reusedCount: count("reused"), degradedRequiredCount: count("pointer_degraded"), pluginDelivered: delivered.some(item => item.key === plugin?.key),
       ...(plan.item ? { planDelivered: plan.delivered.length > 0 } : {}),
       ledgerState: "pending", items: plan.item ? [plan.item, ...items] : items, warnings: issues,

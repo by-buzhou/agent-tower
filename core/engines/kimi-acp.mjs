@@ -1,20 +1,17 @@
 import { resolveSessionPrompt } from "../spec-context.mjs";
-import { closeAcpSession } from "./generic-acp.mjs";
-import { PLUGIN_VERSION } from "../daemon-client.mjs";
+import { classifyAcpError, closeAcpSession, extractAcpToolTextAndDiff, initializeAcp, resumeOrCreateAcpSession } from "./acp-protocol.mjs";
 import { nativePath, ensureMainRoot } from "../storage-paths.mjs";
 import * as crypto from "node:crypto";
 import { isInheritedEffort, isInheritedModel, normalizeEffortForTarget, normalizePermissionModeForProvider } from "../catalog.mjs";
 import {
-  spawnNoWindow,
+  binaryFingerprint,
+  settleTurnWithClose,
+  flattenAcpOptions,
+  startRpcProcess,
   buildCleanChildEnv,
-  classifyErrorCategory,
-  createNdjsonRpcConnection,
-  forceKillProcessTree,
   gracefulCancelWithEscalation,
   mapAcpPermissionOutcome,
   resolveKimiBinary,
-  resumeOrCreateAcpSession,
-  safeEngineError,
 } from "./proc-utils.mjs";
 
 /** Kimi ACP native modes: plan / default (ask) / auto / yolo. Only explicit yolo-class values unlock yolo. */
@@ -23,27 +20,6 @@ export function resolveKimiAcpMode(permissionMode, interactionMode) {
   if (inter === "plan" || String(permissionMode || "").trim().toLowerCase() === "plan") return "plan";
   const mode = normalizePermissionModeForProvider("kimi-code", permissionMode, { fallback: "default", strictReadOnly: false });
   return ["plan", "default", "auto", "yolo"].includes(mode) ? mode : "default";
-}
-
-function extractAcpToolTextAndDiff(contentArr) {
-  if (!Array.isArray(contentArr)) return { text: "", diff: undefined };
-  const textParts = [];
-  let diff;
-  for (const entry of contentArr) {
-    if (!entry || typeof entry !== "object") continue;
-    if (entry.type === "diff") {
-      diff = {
-        path: entry.path,
-        oldText: entry.oldText ?? "",
-        newText: entry.newText ?? "",
-      };
-    } else if (entry.type === "content" && entry.content?.type === "text" && entry.content.text) {
-      textParts.push(entry.content.text);
-    } else if (entry.type === "text" && entry.text) {
-      textParts.push(entry.text);
-    }
-  }
-  return { text: textParts.join("\n"), diff };
 }
 
 /**
@@ -62,25 +38,32 @@ export function runKimiTurn({
   prompt,
   freshSessionPrompt,
   ephemeral = false,
+  inheritHostMcp = false,
+  mcpServers,
+  warmPool,
   onEvent,
   onPermissionRequest,
   onQuestionRequest,
+  asyncTeardown = true,
 }) {
   cwd = nativePath(cwd || process.env.AGENT_TOWER_DEFAULT_ROOT || ensureMainRoot());
   const bin = resolveBinary();
-  const proc = spawnNoWindow(bin.command, [...bin.prefixArgs, "acp"], {
-    cwd,
-    stdio: ["pipe", "pipe", "pipe"],
-
-    env: buildCleanChildEnv(bin.env),
+  const start = directory => startRpcProcess(bin.command, [...(bin.prefixArgs || []), "acp"], {
+    cwd: directory, env: buildCleanChildEnv(bin.env),
   });
+  const initialize = rpc => initializeAcp(rpc, { elicitation: true });
+  const spare = warmPool?.acquire("kimi-code", binaryFingerprint(bin), inheritHostMcp === true, start, initialize);
+  const { proc, rpc, close, kill } = spare || start(cwd);
+  let initHandshakeMs = spare?.initHandshakeMs;
+  const timing = () => ({ warmHit: Boolean(spare), ...(initHandshakeMs === undefined ? {} : { initHandshakeMs }) });
 
   let promptSent = false;
   let settled = false;
   let cancelRequested = false;
   const resumeSessionId = ephemeral ? undefined : nativeSessionId;
   let boundSessionId = resumeSessionId || "";
-  let agentCapabilities;
+  let initialized;
+  let openedSession = false;
   let assistantText = "";
   let reasoningText = "";
   let latestConfigOptions;
@@ -115,8 +98,9 @@ export function runKimiTurn({
   const kimiMode = resolveKimiAcpMode(permissionMode, interactionMode);
   const autoApproveAll = kimiMode === "yolo";
 
-  const rpc = createNdjsonRpcConnection(proc, {
+  rpc.setHandlers({
     onNotification(method, params) {
+      if (settled || (params?.sessionId && params.sessionId !== boundSessionId)) return;
       const update = method === "session/update" ? params?.update : params;
       if ((method === "config_option_update" || update?.sessionUpdate === "config_option_update") &&
           (!params?.sessionId || !boundSessionId || params.sessionId === boundSessionId) && Array.isArray(update?.configOptions)) {
@@ -231,6 +215,7 @@ export function runKimiTurn({
     },
     async onServerRequest(method, params, rpcId) {
       if (method === "session/request_permission") {
+        if (settled || (params?.sessionId && params.sessionId !== boundSessionId)) return { outcome: { outcome: "cancelled" } };
         const options = Array.isArray(params?.options) ? params.options : [];
         if (autoApproveAll) return { outcome: mapAcpPermissionOutcome("approve_once", options) };
         if (!onPermissionRequest) return { outcome: mapAcpPermissionOutcome(undefined, options) };
@@ -268,6 +253,7 @@ export function runKimiTurn({
       }
 
       if (method === "elicitation/create") {
+        if (settled || (params?.sessionId && params.sessionId !== boundSessionId)) return { action: "decline" };
         if (!onQuestionRequest) {
           return { action: "decline" };
         }
@@ -313,44 +299,25 @@ export function runKimiTurn({
     },
   });
 
-  const cleanupProcess = async () => {
-    rpc.closeStdin();
-    if (proc.exitCode === null) {
-      await Promise.race([
-        new Promise((r) => proc.once("exit", r)),
-        new Promise((r) => setTimeout(r, 400)),
-      ]);
-      if (proc.exitCode === null) {
-        await forceKillProcessTree(proc);
-      }
-    }
-    rpc.dispose();
-  };
-
-  const result = (async () => {
+  const rawResult = (async () => {
     try {
-      const initialized = await rpc.request(
-        "initialize",
-        {
-          protocolVersion: 1,
-          clientInfo: { name: "agent-tower", version: PLUGIN_VERSION },
-          clientCapabilities: {
-            fs: { readTextFile: false, writeTextFile: false },
-            terminal: false,
-            elicitation: { form: true },
-          },
-        },
-        20000
-      );
-      agentCapabilities = initialized?.agentCapabilities;
-
-      // Only a clearly missing session may fork a new context; transient resume failures surface as errors.
-      const opened = await resumeOrCreateAcpSession(rpc, { nativeSessionId: resumeSessionId, cwd, resumeTimeoutMs: 15000, newTimeoutMs: 15000 });
+      if (spare) initialized = spare.initialized;
+      else {
+        const started = performance.now();
+        initialized = await initialize(rpc);
+        initHandshakeMs = Math.round(performance.now() - started);
+      }
+      const opened = await resumeOrCreateAcpSession(rpc, {
+        nativeSessionId: resumeSessionId, cwd, capabilities: initialized.capabilities,
+        mcpServers: inheritHostMcp === true ? mcpServers : undefined,
+      });
+      openedSession = true;
       boundSessionId = opened.sessionId;
       const sessionData = opened.sessionData;
 
       emit({
         type: "session_bound",
+        ...timing(),
         nativeSessionId: boundSessionId,
         sessionId: boundSessionId,
         resumed: opened.resumed && boundSessionId === resumeSessionId,
@@ -377,7 +344,7 @@ export function runKimiTurn({
 
       const thinkingOpt = latestConfigOptions.find((o) => o?.id === "thinking" || o?.category === "thought_level");
       if (effort && !isInheritedEffort(effort) && Array.isArray(thinkingOpt?.options)) {
-        const allowed = thinkingOpt.options.flatMap((o) => Array.isArray(o?.options) ? o.options : [o])
+        const allowed = flattenAcpOptions(thinkingOpt.options)
           .map((o) => o?.value ?? o?.id).filter((v) => typeof v === "string");
         const chosen = allowed.length ? normalizeEffortForTarget("kimi-code", model, effort, allowed) : undefined;
         if (chosen && thinkingOpt.currentValue !== chosen) {
@@ -421,9 +388,6 @@ export function runKimiTurn({
         prompt: [{ type: "text", text: resolveSessionPrompt(prompt, freshSessionPrompt, opened.resumed && boundSessionId === resumeSessionId) }],
       });
 
-      // Allow trailing usage_update notification to flush over stdout
-      await new Promise((r) => setTimeout(r, 120));
-
       const stopReason = promptRes?.stopReason || "end_turn";
       const isCancelled = cancelRequested || stopReason === "cancelled";
 
@@ -447,13 +411,8 @@ export function runKimiTurn({
         };
       }
 
-      const fullError = safeEngineError(err);
-      emit({
-        type: "error",
-        message: fullError,
-        error: fullError,
-        category: classifyErrorCategory(fullError, err?.rpcCode),
-      });
+      const classification = classifyAcpError(err, initialized, "kimi");
+      emit({ type: "error", message: classification.error, ...classification });
 
       return {
         status: "failed",
@@ -462,20 +421,24 @@ export function runKimiTurn({
         assistantText,
         reasoningText,
         usage,
-        error: fullError,
+        ...classification,
       };
     } finally {
       settled = true;
-      try {
-        await closeAcpSession(rpc, boundSessionId, agentCapabilities, ephemeral, 1500);
-      } finally {
-        await cleanupProcess();
-      }
     }
-  })();
+  })().then(value => ({ ...value, ...timing() }));
+
+  const { result, closed } = settleTurnWithClose(rawResult, async () => {
+    for (const resolve of pendingPermissions.values()) resolve("cancel");
+    for (const resolve of pendingQuestions.values()) resolve({ cancelled: true });
+    try {
+      if (openedSession) await closeAcpSession(rpc, boundSessionId, initialized?.capabilities, ephemeral, 1500);
+    } finally { await close(); }
+  }, emit, asyncTeardown);
 
   return {
     async cancel() {
+      if (settled) return;
       cancelRequested = true;
       await gracefulCancelWithEscalation(
         proc,
@@ -485,7 +448,8 @@ export function runKimiTurn({
           }
         },
         () => settled,
-        2000
+        2000,
+        kill
       );
     },
     async forceKill() {
@@ -494,7 +458,7 @@ export function runKimiTurn({
       pendingPermissions.clear();
       for (const [, resolveQues] of pendingQuestions) resolveQues({ cancelled: true });
       pendingQuestions.clear();
-      await forceKillProcessTree(proc);
+      await kill();
     },
     async steer(_text) {
       // Kimi ACP rejects concurrent prompts on the same session with turn.agent_busy;
@@ -510,5 +474,6 @@ export function runKimiTurn({
       if (resolver) resolver(answers);
     },
     result,
+    closed,
   };
 }

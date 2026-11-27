@@ -1,6 +1,6 @@
 import { captureNoWindow } from "./engines/proc-utils.mjs";
 import * as crypto from "node:crypto";
-import { copyFileSync, existsSync } from "node:fs";
+import { existsSync, lstatSync } from "node:fs";
 import * as fsp from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { inside, studioDir } from "./storage-paths.mjs";
@@ -423,6 +423,16 @@ export async function inspectWorktreeSafety({ worktreePath, repoRoot } = {}) {
   return result;
 }
 
+function isPrimaryGitRoot(dir) {
+  if (!dir) return false;
+  try {
+    const dotGit = path.join(dir, ".git");
+    return lstatSync(dotGit).isDirectory() && ["HEAD", "refs", "objects"].every(name => existsSync(path.join(dotGit, name)));
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Create an isolated Git worktree and dedicated branch for a parallel subagent.
  */
@@ -435,27 +445,14 @@ export async function createIsolatedWorktree({
   baseRef = "HEAD",
 } = {}) {
   const sourceDir = workspace || cwd || process.cwd();
-  const repoRoot = await getRepoRoot(sourceDir);
+  const normalizedSource = normalizeFsPath(sourceDir);
+  const repoRoot = isPrimaryGitRoot(normalizedSource) ? normalizedSource : await getRepoRoot(sourceDir);
   if (!repoRoot) {
     throw Object.assign(
       new Error(`无法创建 Git Worktree：当前目录不是有效的 Git 仓库 (${sourceDir})`),
       { code: "WORKTREE_CREATE_FAILED" },
     );
   }
-
-  // Ensure the repository has at least one commit
-  let baseSha = "";
-  try {
-    const rev = await runGit(["rev-parse", "--verify", `${baseRef}^{commit}`], { cwd: repoRoot });
-    baseSha = rev.stdout.trim();
-  } catch {
-    throw Object.assign(
-      new Error(`无法创建 Git Worktree：基准引用 "${baseRef}" 无效或仓库尚无初始 Commit。`),
-      { code: "WORKTREE_CREATE_FAILED" },
-    );
-  }
-
-  await pruneStaleWorktrees(repoRoot);
 
   const shortSuffix = (threadId ? sanitizeBranchFragment(threadId).slice(-6) : "") || crypto.randomUUID().slice(0, 6);
   const slug = sanitizeBranchFragment(taskSlug || branch || "subagent");
@@ -466,17 +463,24 @@ export async function createIsolatedWorktree({
   const folderName = `${slug}-${shortSuffix}-${Date.now().toString(36).slice(-4)}`;
   let worktreePath = normalizeFsPath(path.join(rootBase, folderName));
 
-  // Create branch + worktree atomically; if branch name already exists, suffix a random token
-  let finalBranch = branchName;
-  try {
-    await runGit(["show-ref", "--verify", "--quiet", `refs/heads/${finalBranch}`], { cwd: repoRoot });
-    finalBranch = `${branchName}-${crypto.randomUUID().slice(0, 4)}`;
-  } catch {
-    // Branch does not exist yet — safe to create with -b
-  }
+  // Verify baseRef and check branch existence in parallel to cut subprocess latency.
+  const [baseSha, branchExists] = await Promise.all([
+    runGit(["--no-optional-locks", "rev-parse", "--verify", "--end-of-options", `${baseRef}^{commit}`], { cwd: repoRoot })
+      .then((rev) => rev.stdout.trim())
+      .catch(() => {
+        throw Object.assign(
+          new Error(`无法创建 Git Worktree：基准引用 "${baseRef}" 无效或仓库尚无初始 Commit。`),
+          { code: "WORKTREE_CREATE_FAILED" },
+        );
+      }),
+    runGit(["--no-optional-locks", "show-ref", "--verify", "--quiet", `refs/heads/${branchName}`], { cwd: repoRoot })
+      .then(() => true, () => false),
+  ]);
 
-  const createOptions = { cwd: repoRoot, timeoutMs: 60000 };
-  try {
+  const finalBranch = branchExists ? `${branchName}-${crypto.randomUUID().slice(0, 4)}` : branchName;
+
+  const createOptions = { cwd: repoRoot, env: { LC_ALL: "C" }, timeoutMs: 60000 };
+  async function addWorktree() {
     try {
       await runGit(["worktree", "add", "-b", finalBranch, worktreePath, baseSha], createOptions);
     } catch (error) {
@@ -484,6 +488,20 @@ export async function createIsolatedWorktree({
       // Git has created the branch. A shorter folder also shortens the Git administrative path used by remove.
       worktreePath = normalizeFsPath(path.join(rootBase, crypto.randomBytes(4).toString("hex")));
       await runGit(["worktree", "add", worktreePath, finalBranch], createOptions);
+    }
+  }
+  try {
+    try {
+      await addWorktree();
+    } catch (firstError) {
+      if (!/missing but already registered worktree/.test(firstError.stderr)) throw firstError;
+      await pruneStaleWorktrees(repoRoot);
+      // add -b can create the ref before noticing the stale registration.
+      const ref = await runGit(["--no-optional-locks", "rev-parse", "--verify", `refs/heads/${finalBranch}`],
+        { cwd: repoRoot }).then(result => result.stdout.trim(), () => null);
+      if (!ref) await addWorktree();
+      else if (ref === baseSha) await runGit(["worktree", "add", worktreePath, finalBranch], createOptions);
+      else throw firstError;
     }
   } catch (error) {
     throw Object.assign(
@@ -507,7 +525,7 @@ export async function createIsolatedWorktree({
           const stat = await fsp.lstat(srcPath);
           if (stat.isFile()) {
             await fsp.mkdir(path.dirname(dstPath), { recursive: true });
-            copyFileSync(srcPath, dstPath);
+            await fsp.copyFile(srcPath, dstPath);
           }
         }
       }

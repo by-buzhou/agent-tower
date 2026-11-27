@@ -283,14 +283,28 @@ export const BUILTIN_EXTENSION_TEMPLATES = Object.freeze([
     displayName: "Gemini CLI",
     protocol: "acp",
     command: "gemini",
-    args: Object.freeze(["--experimental-acp"]),
-    argsTemplate: "--experimental-acp",
-    description: "Google 官方开源 Gemini CLI（实验性 ACP 协议模式）",
+    args: Object.freeze(["--acp"]),
+    argsTemplate: "--acp",
+    description: "Google 官方开源 Gemini CLI（标准 ACP 协议模式）",
     installHint: "npm install -g @google/gemini-cli",
     homeSubdir: ".gemini",
     defaultModels: Object.freeze([
       Object.freeze({ slug: "gemini-2.5-pro", name: "Gemini Pro", isDefault: true }),
       Object.freeze({ slug: "gemini-2.5-flash", name: "Gemini Flash" }),
+    ]),
+  }),
+  Object.freeze({
+    id: "qwen-code",
+    aliases: Object.freeze(["qwen"]),
+    displayName: "Qwen Code",
+    protocol: "acp",
+    command: "qwen",
+    args: Object.freeze(["--acp"]),
+    argsTemplate: "--acp",
+    homeSubdir: ".qwen",
+    installHint: "npm install -g @qwen-code/qwen-code",
+    defaultModels: Object.freeze([
+      Object.freeze({ slug: "qwen3-coder-plus", name: "Qwen3 Coder Plus", isDefault: true }),
     ]),
   }),
   Object.freeze({
@@ -488,6 +502,7 @@ export function normalizeProviderId(id) {
   ) {
     return "kimi-code";
   }
+  if (lower === "qwen" || lower === "qwen-code") return "qwen-code";
   if (lower === "codex" || lower === "openai" || lower === "openai-codex") {
     return "codex";
   }

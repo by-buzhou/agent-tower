@@ -1225,6 +1225,8 @@ export function openOrchestratorDb(dbPath) {
         prompt: current.prompt || "",
         title: meta.title || "",
         taskId: meta.taskId || "",
+        timings: meta.timings || null,
+        preparationStage: meta.preparationStage || null,
         usage,
         usageReported: Boolean(meta.usageReported || usage.totalTokens > 0 || usage.inputTokens > 0 || usage.outputTokens > 0),
         startedAt: current.started_at || current.created_at || 0,
@@ -1848,7 +1850,9 @@ export function openOrchestratorDb(dbPath) {
           VALUES (?, ?, ?, ?, ?, ?, ?)
           ON CONFLICT(provider, native_session_id, spec_key) DO UPDATE SET
             sha256 = excluded.sha256, tier = excluded.tier, run_id = excluded.run_id, updated_at = excluded.updated_at
-          WHERE sha256 <> excluded.sha256 OR excluded.tier = 'inline' OR (tier <> 'inline' AND (tier = 'summary' OR excluded.tier = 'pointer_degraded'))`);
+          WHERE sha256 <> excluded.sha256 OR excluded.tier = 'inline'
+            OR (excluded.tier = 'pointer_degraded' AND tier <> 'inline')
+            OR (excluded.tier = 'summary' AND tier IN ('path', 'summary'))`);
         const now = Date.now();
         for (const entry of delivered) upsert.run(provider, sessionId, entry.key, entry.sha256, entry.tier, runId, now);
         const meta = { injectedSpecs };

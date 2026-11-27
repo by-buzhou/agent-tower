@@ -279,3 +279,46 @@ export function formatThreadElapsed(t) {
   if (t.completedAt && t.startedAt) return formatDurationMs(t.completedAt - t.startedAt);
   return '—';
 }
+
+function isFiniteTimingMs(value) {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0;
+}
+
+function formatTimingMs(ms) {
+  const n = Math.max(0, Number(ms) || 0);
+  return n < 1000 ? `${Math.round(n)}ms` : `${(n / 1000).toFixed(1)}s`;
+}
+
+/** v0.3.4 成员详情抽屉阶段耗时胶囊条：按 run.meta.timings 渲染预热命中、Worktree、快照、就绪、首字及运行中阶段徽标。 */
+export function renderRunTimingsBarHtml(run, { live = false, hasText = false, hasTools = false } = {}) {
+  const t = run?.timings || run?.meta?.timings;
+  if (!t || typeof t !== 'object') return '';
+  const pills = [];
+  if (t.warmHit === 1 || t.warmHit === true) {
+    pills.push('<span class="md-timing-pill is-warm" title="使用已完成握手的单次备机">⚡ 预热命中</span>');
+  }
+  if (isFiniteTimingMs(t.worktreeMs)) {
+    pills.push(`<span class="md-timing-pill" title="Git Worktree 隔离工作树创建耗时">🌿 Worktree ${escapeHtml(formatTimingMs(t.worktreeMs))}</span>`);
+  }
+  if (isFiniteTimingMs(t.snapshotMs)) {
+    pills.push(`<span class="md-timing-pill" title="评审 Git 快照采集耗时">📸 快照 ${escapeHtml(formatTimingMs(t.snapshotMs))}</span>`);
+  }
+  if (isFiniteTimingMs(t.sessionBoundMs)) {
+    pills.push(`<span class="md-timing-pill" title="引擎会话握手就绪耗时">🚀 就绪 ${escapeHtml(formatTimingMs(t.sessionBoundMs))}</span>`);
+  }
+  if (isFiniteTimingMs(t.firstTextMs)) {
+    pills.push(`<span class="md-timing-pill" title="首字输出耗时 (TTFT)">✍️ 首字 ${escapeHtml(formatTimingMs(t.firstTextMs))}</span>`);
+  }
+  if (live) {
+    const stage = run.preparationStage || run.meta?.preparationStage;
+    if (stage === 'preparing') {
+      pills.push('<span class="md-timing-pill is-live">⏳ 准备中…</span>');
+    } else if (!isFiniteTimingMs(t.sessionBoundMs)) {
+      pills.push('<span class="md-timing-pill is-live">🔌 握手中…</span>');
+    } else if (!isFiniteTimingMs(t.firstTextMs) && !hasText) {
+      pills.push(`<span class="md-timing-pill is-live">${hasTools ? '🛠 执行中…' : '💭 思考中…'}</span>`);
+    }
+  }
+  if (!pills.length) return '';
+  return `<div class="md-timings-bar" aria-label="阶段耗时">${pills.join('')}</div>`;
+}

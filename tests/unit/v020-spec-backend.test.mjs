@@ -416,8 +416,11 @@ test("a prior summary upgrades to inline, archived records expire on checkpoint"
     db.upsertTurnItem({ id: "item_user_run", runId: "run", threadId, type: "user_message", text: "raw" });
     card(cwd, "style", "tags: [style]", "a short body");
     const inventory = readProjectSpecs(cwd);
-    db.specLedger.acknowledge({ provider: "codex", sessionId: "id", runId: "run", threadId, injectedSpecs: {},
-      delivered: [{ key: "coding/style", sha256: inventory.specs[0].sha256, tier: "summary" }] });
+    for (const tier of ["path", "summary", "path"]) {
+      db.specLedger.acknowledge({ provider: "codex", sessionId: "id", runId: "run", threadId, injectedSpecs: {},
+        delivered: [{ key: "coding/style", sha256: inventory.specs[0].sha256, tier }] });
+    }
+    assert.equal(db.specLedger.read("codex", "id").get("coding/style").tier, "summary");
     const result = assembleSpecPrompt({ inventory, cwd, repoRoot: cwd, role: "executor", rawPrompt: "style", dynamicPrompt: "style",
       selection: specSelection({}), ledger: db.specLedger.read("codex", "id") });
     assert.equal(result.delta.meta.items.find(s => s.key === "coding/style").tier, "inline");
@@ -441,7 +444,7 @@ for await (const line of createInterface({ input: process.stdin })) {
   const { id, method, params } = JSON.parse(line);
   if (id == null) continue;
   let result = {};
-  if (method === "initialize") result = { protocolVersion: 1 };
+  if (method === "initialize") result = { protocolVersion: 1, agentCapabilities: { sessionCapabilities: { resume: {} } } };
   if (method === "session/resume") {
     console.log(JSON.stringify({ jsonrpc: "2.0", method: "session/update", params: { update: {
       sessionUpdate: "agent_message_chunk", content: { type: "text", text: "historical output" },
@@ -459,8 +462,10 @@ for await (const line of createInterface({ input: process.stdin })) {
 `);
   for (const driver of [runGenericAcpTurn, runKimiTurn]) {
     const events = [];
-    const result = await driver({ cwd, provider: "test-acp", nativeSessionId: "gone",
-      prompt: "DELTA", freshSessionPrompt: "FULL", resolveBinary: () => ({ command: process.execPath, prefixArgs: [script] }), providerConfig: { command: script }, onEvent: event => events.push(event) }).result;
+    const handle = driver({ cwd, provider: "test-acp", nativeSessionId: "gone",
+      prompt: "DELTA", freshSessionPrompt: "FULL", resolveBinary: () => ({ command: process.execPath, prefixArgs: [script] }), providerConfig: { command: script }, onEvent: event => events.push(event) });
+    const result = await handle.result;
+    await handle.closed;
     assert.equal(result.status, "completed", JSON.stringify(result));
     assert.equal(result.nativeSessionId, "replacement");
     const binding = events.find(event => event.type === "session_bound");

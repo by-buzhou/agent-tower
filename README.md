@@ -1,4 +1,4 @@
-# AgentTower v0.3.3.2
+# AgentTower v0.3.4
 
 专为 **Antigravity** 打造的多 Agent 协作编程插件 —— 充分发挥 **Gemini 4** 语言理解与表达优势，在 **AgentTower** 本地面板一站式完成多路派单、军师会审与代码审改。
 
@@ -87,7 +87,7 @@
 | **Antigravity 内置子成员**<br>*(Gemini 4 / Orchestrator)* | **宿主原生接口直调**<br>`swarm` + `invoke_subagent` | 锁模型/思考档位或多轮具名驻留走原生 `swarm`（支持 `@name` 秒级唤醒），轻量单次委派走 `invoke_subagent`；面板只读追踪转录流实时同步进度，不拉起外部桥接进程，绝不在宿主乱开顶层窗口。 |
 | **OpenAI Codex** | **本地 `app-server` 双向协议** | 支持运行中 `⚡ Steer` 实时热注入纠偏、原生 `read-only` 沙盒诊断与审改一体闭环。 |
 | **Claude Code** | **双向 `stream-json` 控制流** | 支持运行中实时 `Steer`、面板内交互式工具权限审批（`can_use_tool`）与追问回填。 |
-| **Kimi Code 及开放扩展引擎**<br>*(OpenCode / Gemini CLI / Cursor 等)* | **标准 ACP 协议 / 可配置 CLI** | 通过标准 Agent Client Protocol 或扩展模板即插即用；统一接入全链路默认拒绝（Fail-Closed）审批门禁、跨回合原子重开纠偏与连根清理子孙进程树的两阶段安全停止。 |
+| **Kimi Code 及开放扩展引擎**<br>*(OpenCode / Gemini CLI / Qwen Code / Cursor 等)* | **标准 ACP v1 协议 / 可配置 CLI** | 通过标准 Agent Client Protocol v1 能力协商底座（含版本/登录指引/会话恢复与分组模型发现）或扩展模板即插即用；内置 `codex / kimi` 单次预初始化备机槽加速冷启动，统一接入默认拒绝（Fail-Closed）审批门禁与进程树两阶段安全停止。 |
 
 > 实际可用模型取决于本机已安装的引擎及其自身登录授权，AgentTower 严格透传各引擎原生权限档位，绝不越界绕过授权边界。
 
@@ -104,7 +104,7 @@
 **第 1 句（安装挂载 + 预扫本机 Agent 环境）**：
 
 ```text
-请帮我安装并配置 AgentTower 插件：先检查本机 Node.js（需 >= 24.0.0）与 Git 环境，并扫描 PATH 中已安装的编程 Agent CLI（如 claude、codex、kimi、opencode、gemini、cursor、aider、goose、kiro）；接着将 https://github.com/by-buzhou/agent-tower.git 克隆到用户目录下的 ~/.agent-tower/src（若已存在则拉取最新代码），进入该目录执行 npm run setup 和 npm run status:plugin。确认守护进程 live 为 true 后，列出本机已检测到的 Agent 清单，并提醒我重载一次 Antigravity 窗口以完成自动配阵。
+请帮我安装并配置 AgentTower 插件：先检查本机 Node.js（需 >= 24.0.0）与 Git 环境，并扫描 PATH 中已安装的编程 Agent CLI（如 claude、codex、kimi、opencode、gemini、qwen、cursor、aider、goose、kiro）；接着将 https://github.com/by-buzhou/agent-tower.git 克隆到用户目录下的 ~/.agent-tower/src（若已存在则拉取最新代码），进入该目录执行 npm run setup 和 npm run status:plugin。确认守护进程 live 为 true 后，列出本机已检测到的 Agent 清单，并提醒我重载一次 Antigravity 窗口以完成自动配阵。
 ```
 
 **第 2 句（重载窗口后，让 AI 自动握手并配好全部可用引擎与阵容）**：
@@ -205,7 +205,7 @@ npm run setup
 ![全局配置 - 扩展平台：已检测第三方 CLI 一键启用、模板库与自定义接入](.github/readme/08-global-extensions.png)
 
 - **默认成员池**（第 2 子页）：交互与项目配置的「成员与阵容」完全相同，但这里编辑的是**全局默认母版**——之后打开任何未单独定制的新项目都会自动继承这套角色与模型阵容。
-- **扩展平台**（第 3 子页，如上图）：除内置直连的 Antigravity、Claude Code、Codex、Kimi Code 四大核心引擎外，面板内置了 **OpenCode、Gemini CLI、Aider、Cursor Agent、Grok CLI、Kiro CLI、Goose** 扩展模板：
+- **扩展平台**（第 3 子页，如上图）：除内置直连的 Antigravity、Claude Code、Codex、Kimi Code 四大核心引擎外，面板内置了 **OpenCode、Gemini CLI、Qwen Code、Aider、Cursor Agent、Grok CLI、Kiro CLI、Goose** 扩展模板：
   - 本机已安装对应 CLI 时会自动归入上方 `已接入` 区并标出 **`本机已检测`**，直接点 **`启用`** 即可完成握手接入；
   - 可执行文件不在默认 `PATH` 时，点开下方 **`可接入模板库`** 对应行的 **`配置`** 填写路径或环境变量（凭据仅存本地控制目录，面板脱敏不回显）；
   - 接入其他支持标准 ACP（JSON-RPC over Stdio）或命令行占位符模板的工具时，点右上角 **`+ 自定义`** 按向导填入命令并探测通过即可保存进角色池调度。

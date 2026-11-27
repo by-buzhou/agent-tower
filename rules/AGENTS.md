@@ -1,4 +1,4 @@
-# AgentTower v0.3.3.2 编排准则
+# AgentTower v0.3.4 编排准则
 
 0. 新对话默认 `direct`（`dispatchEnabled: false`）。遇 `host_direct_only` 或 `PreToolUse` 拒绝，主会话独立完成，禁重试或绕道委派。
 1. 统一经 `agent-tower_orchestrator` 传 `cwd`、`conversationId`。`antigravity` 按 `hostActions` 代派：锁模/驻留用 `swarm({ action: "add", name, model })`，待命用 `post_message` 唤醒；`inherit` 或粗档位单次用 `invoke_subagent`。禁用 `agentapi new-conversation`，禁发官方 Swarm 链接。[AgentTower](sidecar://agent-tower/studio/)

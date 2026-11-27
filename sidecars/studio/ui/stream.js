@@ -666,6 +666,15 @@ function applySingleEvent(evt) {
   if (data.workCounts && data.rootConversationId === state.conversationPolicy.rootConversationId) {
     Object.assign(state.conversationPolicy, { runningCount: data.workCounts.runningCount, queuedCount: data.workCounts.queuedCount });
   }
+  if (type === 'worktree_preparation') {
+    const id = 'worktree-prep-' + threadId;
+    document.getElementById(id)?.remove();
+    if (data.active && Date.now() - data.timestamp < 3600) {
+      const note = showToast(`🌿 建工作树中… ${data.title || ''}`);
+      if (note) { note.id = id; note.classList.add('worktree-preparation'); }
+    }
+    return;
+  }
   if (type === 'swarm_snapshot' || type === 'swarm.snapshot') {
     const sw = data.swarm || data;
     const evtRoot = String(sw.rootConversationId || data.rootConversationId || '');
@@ -891,6 +900,11 @@ function applySingleEvent(evt) {
   if (!thread || thread.archived) return;
   thread.updatedAt = Date.now();
 
+  if (data.timings && thread.currentRun?.id === data.runId) {
+    thread.currentRun.timings = data.timings;
+    thread.currentRun.preparationStage = null;
+  }
+
   if (type === 'session_bound' || type === 'session.bound') {
     if (data.isNativeHost) thread.isNativeHost = true;
     if (data.nativeSessionId || data.sessionId) {
@@ -938,6 +952,8 @@ function applySingleEvent(evt) {
     thread.currentRun = {
       id: runId,
       status: 'running',
+      timings: data.run?.meta?.timings || null,
+      preparationStage: data.run?.meta?.preparationStage || null,
       inputIntent,
       title: runTitle,
       taskId: runTaskId,
@@ -1162,6 +1178,8 @@ function applySingleEvent(evt) {
     }
     if (!movedOn && thread.currentRun?.id === finishedRunId) {
       thread.currentRun.status = normalizeStatus(thread.status);
+      thread.currentRun.timings = data.run?.meta?.timings || thread.currentRun.timings;
+      thread.currentRun.preparationStage = null;
       thread.currentRun.completedAt = thread.completedAt || Date.now();
       thread.currentRun.usage = { ...thread.usage };
       thread.currentRun.usageReported = Boolean(thread.usageReported);
@@ -1212,6 +1230,7 @@ export function hasAnyActiveRun() {
  * 8. 核心业务交互：单会话切换重置、归档删除、Composer、工作流
  * ======================================================================== */
 export async function resetForConversation(nextConvId) {
+  for (const note of document.querySelectorAll?.('.worktree-preparation') || []) note.remove();
   state.conversationEpoch++;
   state.archivedThreadIds.clear();
   state.hydratingThreadIds = new Set();

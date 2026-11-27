@@ -342,6 +342,7 @@ function commandSearchDirs() {
     path.join(home, ".opencode", "bin"),
     path.join(home, ".grok", "bin"),
     path.join(home, ".kiro", "bin"),
+    path.join(home, ".qwen", "bin"),
     path.join(home, ".local", "bin"),
     path.join(home, ".npm-global", "bin"),
     path.join(home, ".cargo", "bin"),
@@ -404,17 +405,20 @@ export function resolveExternalCommand(command, args = [], extraCandidatePaths =
   if (lower.endsWith(".cmd") || lower.endsWith(".bat")) {
     try {
       const content = readFileSync(target, "utf-8");
-      const dp0 = path.dirname(target);
-      const scriptMatch = /"%dp0%\\([^"]+\.(?:mjs|cjs|js))"/i.exec(content) ||
-        /"%USERPROFILE%\\([^"]+\.(?:mjs|cjs|js))"/i.exec(content);
-      if (scriptMatch) {
-        const base = content.includes("%USERPROFILE%") && !content.includes("%dp0%\\" + scriptMatch[1])
-          ? os.homedir()
-          : dp0;
-        const jsPath = path.resolve(base, scriptMatch[1]);
-        if (isCommandFile(jsPath)) {
-          return { command: nodeCmd, args: [jsPath, ...cleanArgs], env: extraEnv, resolvedPath: jsPath };
+      const invocation = /(?:^|[\s@])"(?:(%~dp0|%dp0%|%USERPROFILE%)[\\/]*)?([^"\r\n]+\.(?:mjs|cjs|js|exe))"(?=\s|$)/gim;
+      for (const match of content.matchAll(invocation)) {
+        const [quoted, root, relative] = match;
+        if (!root && !path.isAbsolute(relative)) continue;
+        const base = root?.toUpperCase() === "%USERPROFILE%" ? os.homedir() : path.dirname(target);
+        const entry = root ? path.resolve(base, ...relative.split(/[\\/]/)) : path.normalize(relative);
+        if (!isCommandFile(entry)) continue;
+        if (/\.exe$/i.test(entry)) {
+          // npm shims may use a sibling node.exe as the interpreter.
+          const tail = content.slice(match.index + quoted.length);
+          if (!/^[ \t]+%\*(?=\s|$)/.test(tail)) continue;
+          return { command: entry, args: cleanArgs, env: {}, resolvedPath: entry };
         }
+        return { command: nodeCmd, args: [entry, ...cleanArgs], env: extraEnv, resolvedPath: entry };
       }
     } catch {}
     throw new Error(
@@ -489,14 +493,18 @@ export function captureNoWindow(command, args, { timeoutMs = 10000, maxBuffer = 
   });
 }
 
-const cleanedProcessTrees = new WeakSet();
+const processTreeKills = new WeakMap();
 
 /**
  * Force-kill an entire OS process tree on Windows (`taskkill /PID /T /F`) or POSIX.
  */
-export async function forceKillProcessTree(proc, { processGroup = false } = {}) {
-  if (!proc || cleanedProcessTrees.has(proc)) return;
-  cleanedProcessTrees.add(proc);
+export function forceKillProcessTree(proc, { processGroup = false } = {}) {
+  if (!proc) return Promise.resolve();
+  if (!processTreeKills.has(proc)) processTreeKills.set(proc, killProcessTree(proc, processGroup));
+  return processTreeKills.get(proc);
+}
+
+async function killProcessTree(proc, processGroup) {
   const pid = proc.pid;
 
   if (process.platform === "win32" && pid) {
@@ -517,29 +525,86 @@ export async function forceKillProcessTree(proc, { processGroup = false } = {}) 
   }
 }
 
+export function binaryFingerprint(bin) {
+  const files = [...new Set([bin.resolvedPath, bin.command].filter(Boolean))];
+  return JSON.stringify([files.map(file => {
+    try {
+      const stat = statSync(file);
+      return [file, stat.mtimeMs, stat.size];
+    } catch { return [file]; }
+  }), bin.prefixArgs || [], bin.env || {}]);
+}
+
+export function startRpcProcess(command, args, { cwd, env, onStderr } = {}) {
+  const processGroup = process.platform !== "win32";
+  const proc = spawnNoWindow(command, args, { cwd, env, stdio: ["pipe", "pipe", "pipe"], detached: processGroup });
+  const exited = new Promise(resolve => {
+    proc.once("exit", resolve);
+    proc.once("error", resolve);
+  });
+  const rpc = createNdjsonRpcConnection(proc, { onStderr });
+  const kill = () => forceKillProcessTree(proc, { processGroup });
+  let closing;
+  const close = (graceMs = 350) => closing ??= (async () => {
+    rpc.dispose();
+    let timer;
+    try {
+      await Promise.race([exited, new Promise(resolve => { timer = setTimeout(resolve, graceMs); })]);
+    } finally { clearTimeout(timer); }
+    await kill();
+    await exited;
+    proc.stdout.destroy();
+    proc.stderr.destroy();
+  })().catch(() => {});
+  return { proc, rpc, exited, close, kill };
+}
+
+export function settleTurnWithClose(rawResult, cleanup, emit, asyncTeardown = false) {
+  const runClose = async () => {
+    const start = performance.now();
+    try { await cleanup(); } catch {}
+    emit?.({ type: "engine_teardown", teardownMs: Math.round(performance.now() - start) });
+  };
+  const closed = rawResult.then(runClose, runClose);
+  const result = asyncTeardown
+    ? rawResult
+    : rawResult.then(
+        async value => { await closed; return value; },
+        async error => { await closed; throw error; },
+      );
+  return { result, closed };
+}
+
+export function closeAfterResult(result, cleanup, emit) {
+  return settleTurnWithClose(result, cleanup, emit, true).closed;
+}
+
 /**
  * Send graceful cancel signal first; if the turn/process does not settle within `graceMs`,
  * automatically escalate to `forceKillProcessTree`.
  */
-export async function gracefulCancelWithEscalation(proc, sendGraceful, isSettledFn, graceMs = 2000) {
+export async function gracefulCancelWithEscalation(proc, sendGraceful, isSettledFn, graceMs = 2000, kill = () => forceKillProcessTree(proc)) {
   try {
     await sendGraceful();
   } catch {
     // Ignore transport write errors during cancel
   }
 
-  if (isSettledFn?.() || !proc || proc.exitCode !== null) {
+  if (isSettledFn?.() || !proc || proc.exitCode !== null || proc.signalCode !== null) {
     return;
   }
 
-  await Promise.race([
-    new Promise((resolve) => proc.once("exit", resolve)),
-    new Promise((resolve) => setTimeout(resolve, graceMs)),
-  ]);
-
-  if (!isSettledFn?.() && proc.exitCode === null) {
-    await forceKillProcessTree(proc);
+  let timer, onExit;
+  try {
+    await Promise.race([
+      new Promise(resolve => { onExit = resolve; proc.once("exit", onExit); }),
+      new Promise(resolve => { timer = setTimeout(resolve, graceMs); }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+    proc.off("exit", onExit);
   }
+  if (!isSettledFn?.() && proc.exitCode === null && proc.signalCode === null) await kill();
 }
 
 /**
@@ -590,6 +655,7 @@ export function createNdjsonRpcConnection(
         if (msg.error) {
           const err = new Error(safeEngineError(msg.error.message, "Engine RPC request failed"));
           err.rpcCode = msg.error.code;
+          err.rpcData = msg.error.data;
           entry.reject(err);
         } else {
           entry.resolve(msg.result);
@@ -600,7 +666,8 @@ export function createNdjsonRpcConnection(
 
     // 2. Server-initiated reverse RPC request (e.g. permission approval or user question)
     if (msg.id !== undefined && msg.id !== null && typeof msg.method === "string") {
-      Promise.resolve().then(() => onServerRequest?.(msg.method, msg.params, msg.id))
+      const handler = onServerRequest;
+      Promise.resolve().then(() => handler?.(msg.method, msg.params, msg.id))
         .then((result) => writeJson(result === undefined
           ? { jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } }
           : { jsonrpc: "2.0", id: msg.id, result }))
@@ -623,7 +690,7 @@ export function createNdjsonRpcConnection(
   if (proc.stderr) {
     proc.stderr.on("data", (chunk) => {
       const text = chunk.toString("utf-8");
-      onStderr?.(text);
+      try { onStderr?.(text); } catch {}
     });
   }
 
@@ -657,6 +724,10 @@ export function createNdjsonRpcConnection(
   });
 
   return {
+    get closed() { return closed; },
+    setHandlers(handlers = {}) {
+      ({ onNotification, onServerRequest, onStderr } = handlers);
+    },
     request(method, params = {}, timeoutMs = 0) {
       if (closed) {
         return Promise.reject(new Error(`RPC connection already closed before calling ${method}`));
@@ -748,33 +819,6 @@ export function isMissingSessionError(err) {
 /** JSON-RPC "method not found" (the agent does not implement this optional method). */
 export function isMethodNotFoundError(err) {
   return Number(err?.rpcCode) === -32601 || /^(?:method not found|unknown method|unsupported method)(?=[:\s]|$)/i.test(String(err?.message || ""));
-}
-
-/**
- * Resume an ACP session (`session/resume`, then `session/load` when resume is unimplemented) and only fall back to
- * `session/new` only when the agent clearly reports the session is gone.
- * Transient failures are rethrown so the caller keeps its nativeSessionId instead of silently losing context.
- */
-export async function resumeOrCreateAcpSession(rpc, { nativeSessionId, cwd, resumeTimeoutMs = 15000, newTimeoutMs = 15000,
-  methods = ["session/resume", "session/load"] } = {}) {
-  if (nativeSessionId) {
-    const params = { sessionId: nativeSessionId, cwd, mcpServers: [] };
-    let unsupported;
-    let missing = false;
-    for (const method of methods) {
-      try {
-        const sessionData = await rpc.request(method, params, resumeTimeoutMs);
-        return { sessionId: nativeSessionId, sessionData: sessionData || {}, resumed: true, method };
-      } catch (err) {
-        if (isMethodNotFoundError(err)) { unsupported = err; continue; }
-        if (isMissingSessionError(err)) { missing = true; break; }
-        throw err;
-      }
-    }
-    if (!missing) throw new Error("ACP 无法恢复此会话：引擎不支持恢复或加载；未另建会话。", { cause: unsupported });
-  }
-  const created = await rpc.request("session/new", { cwd, mcpServers: [] }, newTimeoutMs);
-  return { sessionId: created?.sessionId, sessionData: created || {}, resumed: false, method: "session/new" };
 }
 
 export function classifyErrorCategory(errMessage = "", rpcCode) {

@@ -343,6 +343,7 @@ test("Kimi 和通用 ACP 在成功、早退取消和异常时清理无痕会话"
       const result = await within(handle.result, 8000, trace);
       assert.equal(result.status, status, JSON.stringify(result));
       assert.equal(result.nativeSessionId, undefined);
+      await within(handle.closed, 8000, "ACP teardown");
       const calls = fs.readFileSync(path.join(cwd, trace), "utf8").trim().split(/\r?\n/);
       assert.ok(!calls.includes("session/resume") && !calls.includes("session/load"));
       assert.equal(calls.includes("session/prompt"), scenario !== "cancel");

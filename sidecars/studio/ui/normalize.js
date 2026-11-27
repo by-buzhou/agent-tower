@@ -636,6 +636,8 @@ export function normalizeThread(raw, existing = null) {
       title: String(rawCurrentRun.title || rawCurrentRun.meta?.title || ''),
       taskId: String(rawCurrentRun.taskId || rawCurrentRun.meta?.taskId || ''),
       usage: runUsage,
+      timings: rawCurrentRun.timings || rawCurrentRun.meta?.timings || null,
+      preparationStage: rawCurrentRun.preparationStage || rawCurrentRun.meta?.preparationStage || null,
       usageReported: Boolean(rawCurrentRun.usageReported ?? rawCurrentRun.meta?.usageReported ?? (runUsage.totalTokens > 0)),
       startedAt: Number(rawCurrentRun.startedAt || 0),
       completedAt: rawCurrentRun.completedAt ? Number(rawCurrentRun.completedAt) : null,
