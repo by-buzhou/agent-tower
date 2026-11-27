@@ -64,31 +64,37 @@ export function createDispatchModule(ctx) {
     return clipFinalReport({ finalReport: text, ...(itemId ? { itemId } : {}) }, limit);
   }
 
-  function findNativeHandoff({ handoffId = "", rootConversationId = "", conversationId = "", presetKey = "", swarmName = "", label = "", nativeKind = "", includeClaimed = false, requireUnique = false } = {}) {
+  function findNativeHandoff({ handoffId = "", rootConversationId = "", conversationId = "", presetKey = "", swarmName = "", label = "", nativeKind = "",
+    role = "", unboundWorkspace = "", includeClaimed = false, requireUnique = false, matchesToolArgs } = {}) {
     const rootKey = String(rootConversationId || "").toLowerCase();
     const convKey = String(conversationId || "").toLowerCase();
     const labelKey = String(label || "").trim().toLowerCase();
     const matches = [...nativeHandoffs.values()].filter(ticket =>
-      (includeClaimed || !ticket.claimedAt) &&
+      (includeClaimed || !ticket.claimedAt) && (!ticket.expiresAt || ticket.claimedAt || ticket.expiresAt > Date.now()) &&
       (!handoffId || ticket.handoffId === handoffId) &&
-      (!rootKey || ticket.rootConversationId.toLowerCase() === rootKey) &&
+      (!rootKey || ticket.rootConversationId.toLowerCase() === rootKey ||
+        (!ticket.rootConversationId && unboundWorkspace && projectPathKey(ticket.repoRoot) === projectPathKey(unboundWorkspace))) &&
       (!convKey || String(ticket.conversationId || "").toLowerCase() === convKey) &&
       (!presetKey || ticket.presetKey === presetKey) &&
       (!labelKey || String(ticket.label || "").trim().toLowerCase() === labelKey) &&
       (!nativeKind || ticket.nativeKind === nativeKind) &&
+      (!role || ticket.role === role) &&
+      (!matchesToolArgs || matchesToolArgs(ticket.hostAction)) &&
       (!swarmName || ticket.swarmName.toLowerCase() === String(swarmName).toLowerCase()));
     if (requireUnique && matches.length !== 1) return null;
     return matches.sort((a, b) => b.sequence - a.sequence)[0] || null;
   }
 
-  function createNativeHostHandoff({ params = {}, resolved, rootConversationId = "", role = "executor", brief = "", cwd = "", repoRoot = "", activeMode } = {}) {
+  function createNativeHostHandoff({ params = {}, resolved, rootConversationId = "", role = "executor", brief = "", cwd = "", repoRoot = "", activeMode, curation } = {}) {
     if (resolved?.provider !== "antigravity") return null;
     const settings = ctx.db.getSettings(repoRoot);
     const acpMode = params.antigravityAcpMode || settings.antigravityAcpMode || "off";
     if (acpMode === "api_key") return null;
     const resolvedPresetKey = resolved.routing?.requestedPresetKey || params.presetKey || "";
     const preset = settings.presets?.[resolvedPresetKey] || {};
-    const normalizedRole = preset.group === "reviewer" ? "review" : preset.group || role || "executor";
+    const normalizedRole = resolved.role === "curator" ? "curator" :
+      preset.group === "reviewer" ? "review" : preset.group || role || "executor";
+    const curator = normalizedRole === "curator";
     // Validate only: the plan body reaches the child once, privately, through PreInvocation (nativeChildPlaybook).
     const plan = readPlanDocument({ cwd, repoRoot, planPath: params.planPath });
     const handoffId = makeId("hnd");
@@ -102,51 +108,72 @@ export function createDispatchModule(ctx) {
     const label = preset.label || preset.title || resolvedPresetKey || normalizedRole;
     const rawTask = String(brief || "").trim();
     let nativeBrief = rawTask;
+    if (curator) {
+      nativeBrief = `[AgentTower Curation Ticket #${handoffId}]\n${nativeBrief}`;
+      nativeBrief += "\n\n仅做只读梳理，严禁改写任何文件或执行命令。回复末尾必须附唯一一个以 ```agent-tower-spec-proposal 开头的完整代码块。";
+      if (nativeKind === "swarm") nativeBrief += "向 @coordinator 发送 [done] 消息，消息末尾附同一个完整代码块，再调用 swarm_wait。";
+    }
     if (normalizedRole === "advisor" && nativeKind === "swarm") {
       nativeBrief += "\n\n完成独立盲评后向 @coordinator 发 `@coordinator [done]`，随后调用 swarm_wait；不要先读他人黑板。";
     }
     if (plan?.relPath) nativeBrief += `\n\n定稿规划：${plan.relPath}（已由宿主注入，若未见 <agent_tower_plan> 请直接读取该文件）`;
     let tool;
     let args;
+    let residentConversationId;
+    let boardHead;
     if (nativeKind === "subagent") {
       tool = "invoke_subagent";
-      args = { TypeName: "self", Role: label, Model: coarseModel,
+      args = { TypeName: curator ? "research" : "self", Role: label, Model: coarseModel,
         Workspace: resolved.isolation === "worktree" ? "share" : "inherit", Prompt: nativeBrief };
     } else {
       const cachedSnapshot = ctx.latestSwarmSnapshots.get(rootConversationId) ||
         ctx.latestSwarmSnapshots.get(String(rootConversationId).toLowerCase());
-      const snapshot = cachedSnapshot || (rootConversationId ? readNativeSwarmSnapshot({
+      const liveSnapshot = (!cachedSnapshot || curator) && rootConversationId ? readNativeSwarmSnapshot({
         conversationId: rootConversationId,
         appDataDir: resolveDefaultAppDataDir(params.appDataDir || ctx.hostContext.appDataDir, ctx.hostSync.buildHostEnvForDriver()),
-      }) : null);
-      if (!cachedSnapshot && snapshot?.found) ctx.latestSwarmSnapshots.set(snapshot.rootConversationId, snapshot);
+      }) : null;
+      const snapshot = liveSnapshot?.found ? liveSnapshot : cachedSnapshot;
+      if (liveSnapshot?.found) ctx.latestSwarmSnapshots.set(liveSnapshot.rootConversationId, liveSnapshot);
+      boardHead = Number(snapshot?.head || 0);
       const waiting = snapshot?.members?.find(member => member.name.toLowerCase() === swarmName.toLowerCase() &&
         member.state === "waiting" && !member.killed);
       if (waiting) {
         tool = "post_message";
         args = { text: `@${swarmName} ${nativeBrief}` };
+        residentConversationId = waiting.conversation_id;
       } else {
         tool = "swarm";
         args = { action: "add", name: swarmName, model: buildAgyPinnedModelId(requestedModel, resolved.effort),
           workspace: resolved.isolation === "worktree" ? "share" : "inherit", brief: nativeBrief };
       }
     }
-    const hostPrompt = `请执行宿主原生派遣票据 #${handoffId}：调用 ${tool}，参数 ${JSON.stringify(args)}。严禁调用 agentapi new-conversation 或 agy acp。`;
+    const hostPrompt = `${curator ? `[AgentTower Curation Ticket #${handoffId}]\n` : ""}请执行宿主原生派遣票据 #${handoffId}：调用 ${tool}，参数 ${JSON.stringify(args)}。严禁调用 agentapi new-conversation 或 agy acp。`;
     const hostAction = { handoffId, presetKey: resolvedPresetKey, label, role: normalizedRole, nativeKind, tool, args, hostPrompt };
     const ticket = { handoffId, rootConversationId: String(rootConversationId || ""), presetKey: resolvedPresetKey,
       label, role: normalizedRole, nativeKind, swarmName, requestedModel, cwd: cwd || "", repoRoot: repoRoot || "",
       ...specSelection(params), ...readPathsSelection(params),
       temporaryOverride: Boolean(resolved.routing?.temporaryOverride),
       planPath: plan?.relPath || "", rawTask, brief: nativeBrief, hostAction, sequence: ++handoffSequence, createdAt: Date.now() };
+    if (curator) ctx.specs.issueNativeCuration(ticket, { ...curation, residentConversationId, boardHead });
     nativeHandoffs.set(handoffId, ticket);
-    while (nativeHandoffs.size > 256) nativeHandoffs.delete(nativeHandoffs.keys().next().value);
+    if (curator && ticket.rootConversationId && ctx.hostSync.nativeTranscriptAvailable(ticket.rootConversationId)) {
+      void ctx.hostSync.syncNativeHostConversation(ticket.rootConversationId, { workspace: repoRoot }).catch(error => ctx.log(error.message));
+    }
+    while (nativeHandoffs.size > 256) {
+      const oldest = [...nativeHandoffs.values()].find(item => item.role !== "curator");
+      if (!oldest) break;
+      nativeHandoffs.delete(oldest.handoffId);
+    }
     return { ok: true, bypassed: false, status: "waiting_host_dispatch", code: "HOST_DISPATCH_REQUIRED",
       handoffId, nativeKind, presetKey: resolvedPresetKey, role: normalizedRole, hostAction, hostActions: [hostAction],
+      ...(curator ? { runId: ticket.runId } : {}),
       ...(ticket.temporaryOverride ? { temporaryOverride: true } : {}),
       summary: `待宿主执行原生派遣票据 #${handoffId}（${tool} -> ${resolvedPresetKey || swarmName}）`, activeMode: activeMode || ctx.scopePolicy.getActiveModeSummary({ conversationId: rootConversationId, workspace: repoRoot }) };
   }
 
-  function claimNativeHandoff({ rootConversationId, presetKey, swarmName, label, nativeKind, conversationId }) {
+  function claimNativeHandoff({ rootConversationId, presetKey, swarmName, label, nativeKind, conversationId, curationPrompt, invocation = false,
+    swarmState = "", freshOutput = false }) {
+    if (!rootConversationId) return null;
     const existing = conversationId && findNativeHandoff({ rootConversationId, conversationId, nativeKind, includeClaimed: true });
     // A waiting Swarm member woken for a second job must bind the newer unclaimed ticket (new brief / planPath)
     // instead of replaying the ticket its conversation claimed last time.
@@ -156,6 +183,14 @@ export function createDispatchModule(ctx) {
     const ticket = (label && (!existing || nativeKind === "swarm") ? findNativeHandoff({ rootConversationId, ...member, label, nativeKind }) : null) ||
       (!existing || (nativeKind === "swarm" && (member.presetKey || member.swarmName)) ? findNativeHandoff({ rootConversationId, ...member, nativeKind, requireUnique: !member.presetKey && !member.swarmName }) : null);
     if (!ticket || (existing && ticket.sequence < existing.sequence)) return existing || null;
+    if (ticket.role === "curator" && nativeKind === "subagent" &&
+        curationPrompt !== ticket.hostAction.args.Prompt) return existing || null;
+    if (ticket.role === "curator" && nativeKind === "swarm" && !swarmName && !member.presetKey) return existing || null;
+    if (ticket.role === "curator" && (!conversationId || !(
+      ticket.admittedAt || (ticket.residentConversationId?.toLowerCase() === conversationId.toLowerCase() &&
+        (invocation || freshOutput || ["working", "running"].includes(String(swarmState).toLowerCase())))
+    ))) return existing || null;
+    if (ticket.role === "curator" && !ctx.specs.claimNativeCuration(ticket, conversationId)) return existing || null;
     ticket.claimedAt = Date.now();
     ticket.conversationId = conversationId || "";
     return ticket;
@@ -338,9 +373,14 @@ export function createDispatchModule(ctx) {
     });
     const rechecked = !curation && ctx.scopePolicy.dispatchBypass(params);
     if (rechecked) return rechecked;
-    const nativeHandoff = createNativeHostHandoff({ params, resolved, rootConversationId, role: params.role || "executor",
-      brief: rawTask, cwd: baseWorkspace, repoRoot });
-    if (nativeHandoff) return nativeHandoff;
+    const nativeTarget = () => resolved.provider === "antigravity" &&
+      (params.antigravityAcpMode || ctx.db.getSettings(repoRoot).antigravityAcpMode) !== "api_key";
+    const issueNative = () => createNativeHostHandoff({ params, resolved, rootConversationId, role: params.role || "executor",
+      brief: rawTask, cwd: baseWorkspace, repoRoot, curation: { source: curation?.source, ticketTtlMs: params.ticketTtlMs } });
+    if (nativeTarget()) {
+      if (curation?.beforeStart && !await curation.beforeStart(true)) return null;
+      return issueNative();
+    }
     if (resolved.role !== "curator") readPlanDocument({ cwd: baseWorkspace, repoRoot, planPath: params.planPath });
 
     let threadId = claim?.threadId;
@@ -397,11 +437,10 @@ export function createDispatchModule(ctx) {
         executionIntent: params.executionIntent,
         allowDisabledPreset: Boolean(params.presetKey) && params.allowDisabledPreset === true,
       });
-      const reroutedNative = createNativeHostHandoff({ params, resolved, rootConversationId, role: params.role || "executor",
-        brief: rawTask, cwd: baseWorkspace, repoRoot });
-      if (reroutedNative) {
+      if (nativeTarget()) {
         if (worktreeInfo?.worktreePath) await cleanupWorktree({ worktreePath: worktreeInfo.worktreePath, repoRoot, force: true }).catch(() => {});
-        return reroutedNative;
+        if (curation?.beforeStart && !await curation.beforeStart(true)) return null;
+        return issueNative();
       }
       if (resolved.isolation !== effectiveIsolation) {
         if (worktreeInfo?.worktreePath && resolved.isolation !== "worktree") {
@@ -427,7 +466,7 @@ export function createDispatchModule(ctx) {
       if (worktreeInfo?.worktreePath) await cleanupWorktree({ worktreePath: worktreeInfo.worktreePath, repoRoot, force: true }).catch(() => {});
       throw error;
     }
-    if (curation?.beforeStart && !await curation.beforeStart()) return null;
+    if (curation?.beforeStart && !await curation.beforeStart(false)) return null;
     if (resolved.role === "curator") ctx.specs.assertCuratorAvailable(repoRoot);
     const execCwd = nativePath(worktreeInfo?.worktreePath || (resolved.role === "curator" ? repoRoot : baseWorkspace));
     const isDisposableThread = resolveEphemeralFlag(params, [baseWorkspace, repoRoot, execCwd]);
@@ -1022,6 +1061,7 @@ export function createDispatchModule(ctx) {
     finalReportFields,
     lastAssistantItem,
     findNativeHandoff,
+    revokeNativeHandoff: handoffId => nativeHandoffs.delete(handoffId),
     getTaskStatus,
     launchThread,
     readPathsSelection,

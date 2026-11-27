@@ -2,7 +2,7 @@
   "agent-tower-dispatch-gate": {
     "PreToolUse": [
       {
-        "matcher": "invoke_subagent|define_subagent|run_workflow|swarm",
+        "matcher": "invoke_subagent|define_subagent|run_workflow|swarm|write_file|edit_file|run_command",
         "hooks": [
           {
             "type": "command",
@@ -10,6 +10,13 @@
             "timeout": 5
           }
         ]
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "node ./core/hooks/pre-invocation-mode.mjs",
+        "timeout": 3
       }
     ],
     "PreInvocation": [

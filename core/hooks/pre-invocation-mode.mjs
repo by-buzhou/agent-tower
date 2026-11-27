@@ -26,7 +26,9 @@ async function readInput() {
 try {
   const input = await readInput();
   const conversationId = typeof input?.conversationId === 'string' ? input.conversationId.trim() : '';
-  if (!conversationId) {
+  const stop = input.hookEventName === 'Stop';
+  if (!conversationId || (stop && (input.terminationReason !== 'NO_TOOL_CALL' || input.fullyIdle !== true || input.continuationActive === true ||
+      input.isSubagent === true || (input.parentConversationId && input.parentConversationId !== conversationId)))) {
     empty();
     process.exit(0);
   }
@@ -40,7 +42,7 @@ try {
   const workspacePaths = Array.isArray(input.workspacePaths)
     ? input.workspacePaths.filter(value => typeof value === 'string')
     : [];
-  const call = (params, timeoutMs) => fetch(`http://127.0.0.1:${lease.port}/rpc`, {
+  const call = (params, timeoutMs, method = 'getConversationPolicy') => fetch(`http://127.0.0.1:${lease.port}/rpc`, {
     method: 'POST',
     signal: AbortSignal.timeout(timeoutMs),
     redirect: 'error',
@@ -48,30 +50,34 @@ try {
       'Content-Type': 'application/json',
       'X-Daemon-Token': lease.token,
     },
-    body: JSON.stringify({ method: 'getConversationPolicy', params }),
+    body: JSON.stringify({ method, params }),
   });
-  const baseParams = {
-    conversationId,
-    workspace: workspacePaths[0] || input.cwd || '',
-    syncHostPlaybook: true,
-    initialNumSteps: input.initialNumSteps,
-  };
-  const response = await call({ ...baseParams, deferPlaybookCommit: true }, 2000);
-  if (!response.ok) {
-    empty();
-    process.exit(0);
-  }
-  const payload = await response.json();
-  const result = payload?.ok ? payload.result : null;
-  const playbook = result?.playbookInject;
-  if (typeof playbook === 'string' && playbook) {
-    const output = JSON.stringify({ injectSteps: [{ systemMessage: { systemMessage: playbook } }] }) + '\n';
-    await new Promise((resolve, reject) => process.stdout.write(output, error => error ? reject(error) : resolve()));
-    if (result.playbookCommitToken) {
-      await call({ ...baseParams, confirmPlaybookToken: result.playbookCommitToken }, 400).catch(() => null);
-    }
+  if (stop) {
+    const response = await call({ action: 'stopHookCheck', conversationId, cwd: input.cwd || workspacePaths[0] }, 1400, 'specCuration');
+    const result = response.ok ? (await response.json())?.result : null;
+    if (result?.decision === 'continue' && typeof result.reason === 'string') {
+      process.stdout.write(JSON.stringify({ decision: 'continue', reason: result.reason }) + '\n');
+    } else empty();
   } else {
-    empty();
+    const baseParams = {
+      conversationId,
+      workspace: workspacePaths[0] || input.cwd || '',
+      syncHostPlaybook: true,
+      initialNumSteps: input.initialNumSteps,
+    };
+    const response = await call({ ...baseParams, deferPlaybookCommit: true }, 2000);
+    const payload = response.ok ? await response.json() : null;
+    const result = payload?.ok ? payload.result : null;
+    const playbook = result?.playbookInject;
+    if (typeof playbook === 'string' && playbook) {
+      const output = JSON.stringify({ injectSteps: [{ systemMessage: { systemMessage: playbook } }] }) + '\n';
+      await new Promise((resolve, reject) => process.stdout.write(output, error => error ? reject(error) : resolve()));
+      if (result.playbookCommitToken) {
+        await call({ ...baseParams, confirmPlaybookToken: result.playbookCommitToken }, 400).catch(() => null);
+      }
+    } else {
+      empty();
+    }
   }
 } catch {
   empty();

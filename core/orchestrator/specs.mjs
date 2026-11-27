@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
-import { ensureStorageIgnoreRules, inspectProjectRoot, restricted } from "../storage-paths.mjs";
+import { atomicJson, ensureStorageIgnoreRules, inspectProjectRoot, restricted } from "../storage-paths.mjs";
 import { specLedgerForThread } from "../db.mjs";
 import {
   assembleSpecPrompt, collectWorkspaceFiles, hasActiveProjectSpecs, inspectSpecPath, materializeProjectSpecs, projectSpecStatus, readPlanDocument,
@@ -35,7 +35,11 @@ function lfSha256(data) {
 }
 const isCuratorRole = role => normalizeSpecRole(role) === "curator";
 const settlingActions = new Set(["confirm", "revise", "dismiss"]);
-const curatorActions = new Set(["status", "setEnabled", "archive", "restore", "setAuto", "setLimits", "trigger", ...settlingActions]);
+const curatorActions = new Set(["status", "setEnabled", "archive", "restore", "setAuto", "setLimits", "trigger",
+  "begin", "submit", "cancelTicket", "stopHookCheck", ...settlingActions]);
+const DEFAULT_TICKET_TTL_MS = 120_000;
+const ACTIVE_NATIVE_CURATORS = "active-native-curators.json";
+const bridgeCurationMessage = /\[AgentTower (?:Curation Ticket|Auto-Curation)|请执行宿主原生派遣票据 #hnd_/;
 const ARCHIVE_ROOT = ".agent-tower/spec-archive";
 const archiveEntries = ["01-business", "02-coding", "INDEX.md"];
 
@@ -210,6 +214,7 @@ function snapshotSpecTree(workspace) {
     }
   }
   visit(path.join(workspace, SPEC_ROOT), SPEC_ROOT);
+  visit(path.join(workspace, SPEC_ROOT + "-archive"), SPEC_ROOT + "-archive");
   return JSON.stringify(snapshot);
 }
 
@@ -353,7 +358,10 @@ function parseProposal(rawText) {
   if (blocks.length !== 1 || rawText.slice(blocks[0].index + blocks[0][0].length).trim()) {
     throw new Error("回复末尾需要恰好一个 agent-tower-spec-proposal 代码块");
   }
-  const draft = JSON.parse(blocks[0][1]);
+  return validateDraft(JSON.parse(blocks[0][1]));
+}
+
+function validateDraft(draft) {
   if (draft?.status === "no_change" && typeof draft.reason === "string") return draft;
   if (draft?.status !== "propose" || typeof draft.summary !== "string" || !draft.summary.trim() ||
       !Array.isArray(draft.changes) || !draft.changes.length) throw new Error("提案状态、摘要或变更列表无效");
@@ -397,7 +405,7 @@ export function createSpecsModule(ctx) {
       ctx.db.getConversationThread(rootConversationId);
     if (hostThread) {
       const userLines = ctx.db.listTurnItems({ threadId: hostThread.id })
-        .filter(item => (item.type === "user_message" || item.type === "user") && item.text)
+        .filter(item => (item.type === "user_message" || item.type === "user") && item.text && !bridgeCurationMessage.test(item.text))
         .slice(-4)
         .map(item => cleanExcerpt(item.text, 220))
         .filter(Boolean);
@@ -420,6 +428,14 @@ export function createSpecsModule(ctx) {
     return blocks.join("\n\n");
   }
 
+  function curatorPromptContext(workspace, rootConversationId) {
+    return {
+      curatedHead: ctx.db.readSpecCuration(workspace).curatedHead || "",
+      curatorContext: buildCuratorSessionContext(workspace, rootConversationId),
+      specLimits: projectSpecLimits(workspace),
+    };
+  }
+
   function curationStatus(workspace) {
     workspace = normalizeProjectPath(workspace);
     const key = projectPathKey(workspace);
@@ -430,7 +446,9 @@ export function createSpecsModule(ctx) {
       workspace: workspace || null,
       specEnabled: Boolean(workspace && enabled), autoTrigger, singleMaxKb, totalMaxKb,
       archive: archiveStatus(workspace),
-      running: Boolean(active), activeThreadId: active?.threadId ?? null, activeRunId: active?.runId ?? null,
+      running: Boolean(active), awaitingHost: active?.awaitingHost === true,
+      activeHandoffId: active?.handoffId ?? null, activeExecutorKind: active?.executorKind ?? null,
+      activeThreadId: active?.threadId ?? null, activeRunId: active?.runId ?? null,
       lastNoChange: state.lastNoChange ?? null, pendingProposal: state.pendingProposal ?? null,
       recentProposals: state.proposals ?? [],
     };
@@ -466,73 +484,224 @@ export function createSpecsModule(ctx) {
       [thread?.presetKey, run?.meta?.nextPresetKey, run?.meta?.requestedPresetKey].some(key => presets?.[key]?.group === "curator");
   }
 
+  function syncNativeCuratorGuards() {
+    const conversationIds = [...activeCurators.values()].filter(active => active.executorKind === "antigravity_subagent")
+      .map(active => active.conversationId || active.residentConversationId).filter(Boolean);
+    const file = path.join(ctx.dataDir, ACTIVE_NATIVE_CURATORS);
+    if (conversationIds.length) atomicJson(file, { conversationIds });
+    else if (inspectSpecPath(file)) fs.rmSync(file, { force: true });
+  }
+
+  function releaseCuration(workspace, active) {
+    clearTimeout(active.timer);
+    activeCurators.delete(projectPathKey(workspace));
+    if (active.executorKind === "antigravity_subagent") {
+      ctx.dispatch.revokeNativeHandoff(active.handoffId);
+      syncNativeCuratorGuards();
+    }
+  }
+
+  function checkCurationSnapshot(workspace, before) {
+    try { if (before === snapshotSpecTree(workspace)) return; } catch {}
+    return curationError("CURATOR_SPEC_WRITE_DETECTED", "运行期间项目规范发生变化，维护官输出已作废");
+  }
+
   function startCurator(thread, run) {
     const workspace = normalizeProjectPath(thread.meta?.projectRoot || thread.workspace || thread.cwd);
     assertCuratorAvailable(workspace, run.id);
     const key = projectPathKey(workspace);
     const rootConversationId = ctx.scopePolicy.threadPolicyRoot(thread) || null;
-    activeCurators.set(key, { threadId: thread.id, runId: run.id });
+    const active = { threadId: thread.id, runId: run.id, executorKind: "external_cli", rootConversationId,
+      triggerSource: run.meta?.triggerSource || thread.meta?.triggerSource || "delegate" };
+    activeCurators.set(key, active);
     publish(workspace, rootConversationId);
     let before;
     return {
       snapshot() { before = snapshotSpecTree(workspace); },
       check() {
         if (before === undefined || !ctx.db.isProjectSpecEnabled(workspace)) return;
-        try { if (before === snapshotSpecTree(workspace)) return; } catch {}
-        return curationError("CURATOR_SPEC_WRITE_DETECTED", "运行期间项目规范发生变化，维护官输出已作废");
+        return checkCurationSnapshot(workspace, before);
       },
       finish(result, rawText) {
-        const autoKey = rootConversationId ? conversationKey(rootConversationId, workspace) : "";
-        const pendingWaterline = autoKey ? inFlightAutoWaterlines.get(autoKey) : null;
-        if (autoKey) inFlightAutoWaterlines.delete(autoKey);
         if (activeCurators.get(key)?.runId !== run.id) return;
-        activeCurators.delete(key);
-        try {
-          if (result.status !== "completed" || before === undefined || !ctx.db.isProjectSpecEnabled(workspace)) {
-            if (pendingWaterline && autoKey) failedAutoWaterlines.set(autoKey, `${pendingWaterline.completedAt}:${pendingWaterline.id}`);
-            return;
-          }
-          const now = Date.now();
-          const triggerSource = run.meta?.triggerSource || thread.meta?.triggerSource || "delegate";
-          const record = { id: makeId("sprop"), workspace, rootConversationId, threadId: thread.id, runId: run.id,
-            triggerSource, status: "invalid", summary: "", changes: [], preflightOk: false, parseError: null,
-            rawText, createdAt: now, updatedAt: now, resolvedAt: null };
-          const commitAutoWaterline = withHead => {
-            const statePatch = {};
-            if (withHead) {
-              const head = readGitHead(workspace);
-              if (head) statePatch.curatedHead = head;
-            }
-            if (pendingWaterline && rootConversationId) {
-              const prev = ctx.db.readSpecCuration(workspace).autoWaterlines || {};
-              statePatch.autoWaterlines = { ...prev, [rootConversationId.toLowerCase()]: pendingWaterline };
-              if (autoKey) failedAutoWaterlines.delete(autoKey);
-            }
-            return statePatch;
-          };
-          try {
-            const draft = parseProposal(rawText);
-            if (draft.status === "no_change") {
-              ctx.db.patchSpecCurationState(workspace, {
-                ...commitAutoWaterline(true),
-                lastNoChange: { threadId: thread.id, runId: run.id, rootConversationId, triggerSource, reason: draft.reason, completedAt: now },
-              });
-              return;
-            }
-            record.summary = draft.summary;
-            record.changes = preflight(workspace, draft.changes, projectSpecLimits(workspace));
-            record.preflightOk = record.changes.every(change => change.preflightOk);
-            if (record.preflightOk) record.status = "pending";
-            const extraState = commitAutoWaterline(record.preflightOk);
-            if (Object.keys(extraState).length) ctx.db.patchSpecCurationState(workspace, extraState);
-          } catch (error) {
-            record.parseError = error.message;
-            if (pendingWaterline && autoKey) failedAutoWaterlines.set(autoKey, `${pendingWaterline.completedAt}:${pendingWaterline.id}`);
-          }
-          ctx.db.putSpecProposal(workspace, record);
-        } finally { publish(workspace, rootConversationId); }
+        finishCuration(workspace, active, { rawText,
+          completed: result.status === "completed" && before !== undefined && !checkCurationSnapshot(workspace, before) });
       },
     };
+  }
+
+  function finishCuration(workspace, active, { rawText = "", draft, completed = true } = {}) {
+    const { rootConversationId, threadId, runId, triggerSource, executorKind } = active;
+    const autoKey = triggerSource === "auto" && rootConversationId ? conversationKey(rootConversationId, workspace) : "";
+    const waterline = autoKey ? inFlightAutoWaterlines.get(autoKey) : null;
+    if (autoKey) inFlightAutoWaterlines.delete(autoKey);
+    let consumedWaterline = false;
+    try {
+      releaseCuration(workspace, active);
+      if (!completed || !ctx.db.isProjectSpecEnabled(workspace)) return null;
+      const now = Date.now();
+      const identity = { threadId: threadId ?? null, runId, rootConversationId: rootConversationId || null, triggerSource, executorKind };
+      const statePatch = withHead => {
+        const head = withHead && readGitHead(workspace);
+        const autoWaterlines = waterline && { ...ctx.db.readSpecCuration(workspace).autoWaterlines,
+          [rootConversationId.toLowerCase()]: waterline };
+        return { ...(head ? { curatedHead: head } : {}), ...(autoWaterlines ? { autoWaterlines } : {}) };
+      };
+      const record = { id: makeId("sprop"), workspace, ...identity, status: "invalid", summary: "", changes: [],
+        preflightOk: false, parseError: null, rawText, createdAt: now, updatedAt: now, resolvedAt: null };
+      try {
+        draft ??= parseProposal(rawText);
+        if (draft.status === "no_change") {
+          ctx.db.patchSpecCurationState(workspace, { ...statePatch(true),
+            lastNoChange: { ...identity, reason: draft.reason, completedAt: now } });
+          consumedWaterline = true;
+          return { status: "no_change" };
+        }
+        record.summary = draft.summary;
+        record.changes = preflight(workspace, draft.changes, projectSpecLimits(workspace));
+        record.preflightOk = record.changes.every(change => change.preflightOk);
+        if (record.preflightOk) record.status = "pending";
+      } catch (error) { record.parseError = error.message; }
+      const proposal = ctx.db.putSpecProposal(workspace, record);
+      if (!record.parseError) {
+        const patch = statePatch(record.preflightOk);
+        if (Object.keys(patch).length) ctx.db.patchSpecCurationState(workspace, patch);
+        consumedWaterline = true;
+      }
+      return { status: proposal.status, proposal };
+    } finally {
+      if (waterline && !consumedWaterline) failedAutoWaterlines.set(autoKey, `${waterline.completedAt}:${waterline.id}`);
+      publish(workspace);
+    }
+  }
+
+  function reserveCuration(workspace, active, ticketTtlMs) {
+    if (activeCurators.has(projectPathKey(workspace))) assertCuratorAvailable(workspace);
+    if (active.awaitingHost) {
+      const ttl = Number.isSafeInteger(ticketTtlMs) && ticketTtlMs > 0
+        ? Math.min(ticketTtlMs, DEFAULT_TICKET_TTL_MS) : DEFAULT_TICKET_TTL_MS;
+      active.expiresAt = Date.now() + ttl;
+      active.timer = setTimeout(() => {
+        if (activeCurators.get(projectPathKey(workspace)) === active && active.awaitingHost) {
+          finishCuration(workspace, active, { completed: false });
+        }
+      }, ttl);
+      active.timer.unref();
+    }
+    activeCurators.set(projectPathKey(workspace), active);
+    try {
+      if (active.residentConversationId) syncNativeCuratorGuards();
+    } catch (error) {
+      clearTimeout(active.timer);
+      activeCurators.delete(projectPathKey(workspace));
+      throw error;
+    }
+    publish(workspace);
+  }
+
+  function issueNativeCuration(ticket, { source = "delegate", ticketTtlMs, residentConversationId, boardHead } = {}) {
+    const workspace = ticket.repoRoot;
+    assertCuratorAvailable(workspace);
+    const active = { executorKind: "antigravity_subagent", handoffId: ticket.handoffId, runId: makeId("run_cur"),
+      rootConversationId: ticket.rootConversationId, triggerSource: source, awaitingHost: true,
+      before: snapshotSpecTree(workspace), residentConversationId, boardHead };
+    reserveCuration(workspace, active, ticketTtlMs);
+    Object.assign(ticket, { runId: active.runId, expiresAt: active.expiresAt, residentConversationId, boardHead });
+  }
+
+  function admitNativeCuration(ticket, root) {
+    const active = activeCurators.get(projectPathKey(ticket.repoRoot));
+    if (active?.handoffId !== ticket.handoffId || !active.awaitingHost || active.expiresAt <= Date.now()) return false;
+    ticket.admittedAt = Date.now();
+    if (!ticket.rootConversationId) {
+      ticket.rootConversationId = root;
+      active.rootConversationId = root;
+    }
+    if (!ctx.nativeWatchers.has(root) && ctx.hostSync.nativeTranscriptAvailable(root)) {
+      void ctx.hostSync.syncNativeHostConversation(root, { workspace: ticket.repoRoot }).catch(error => ctx.log(error.message));
+    }
+    return true;
+  }
+
+  function claimNativeCuration(ticket, conversationId) {
+    const active = activeCurators.get(projectPathKey(ticket.repoRoot));
+    if (active?.handoffId !== ticket.handoffId || !active.awaitingHost || active.expiresAt <= Date.now()) return false;
+    active.conversationId = conversationId;
+    try { syncNativeCuratorGuards(); }
+    catch (error) { delete active.conversationId; throw error; }
+    clearTimeout(active.timer);
+    active.awaitingHost = false;
+    publish(ticket.repoRoot);
+    return true;
+  }
+
+  function observeNativeCuration(ticket, thread, evidence) {
+    const workspace = ticket.repoRoot;
+    const active = activeCurators.get(projectPathKey(workspace));
+    if (active?.handoffId !== ticket.handoffId || active.awaitingHost) return;
+    active.threadId = thread.id;
+    if (typeof evidence.waiting === "boolean") {
+      active.waiting = evidence.waiting;
+      if (!evidence.waiting) active.sawWorking = true;
+    }
+    if (evidence.transcriptSettled) active.transcriptSettled = true;
+    if (evidence.rawText) active.rawText = evidence.rawText;
+    if (!evidence.settled && !(active.waiting && active.rawText &&
+        (active.sawWorking || active.transcriptSettled))) return;
+    const error = checkCurationSnapshot(workspace, active.before);
+    if (error) ctx.log(`${error.code}: ${error.message}`);
+    return finishCuration(workspace, active, { rawText: active.rawText, completed: !error && !evidence.cancelled });
+  }
+
+  function hostMainCuration(workspace, rootConversationId, action, params) {
+    const key = projectPathKey(workspace);
+    const active = activeCurators.get(key);
+    const sessionId = typeof params.sessionId === "string" ? params.sessionId.trim() : "";
+    const caller = typeof params.conversationId === "string" ? params.conversationId.trim() : "";
+    if ((caller && caller.toLowerCase() !== rootConversationId?.toLowerCase()) ||
+        ctx.db.isManagedChildSession(caller) || ctx.db.isManagedChildSession(sessionId)) {
+      throw curationError("CURATOR_HOST_MAIN_REQUIRED", "请在项目主会话中维护规范");
+    }
+    if (sessionId.startsWith("ticket:hnd_") && (active?.executorKind !== "host_main" || sessionId !== `ticket:${active.handoffId}`)) {
+      throw curationError("CURATOR_SESSION_NOT_FOUND", "这张主会话重拟票据已失效");
+    }
+    const matches = active?.executorKind === "host_main" && (active.awaitingHost
+      ? !active.rootConversationId || active.rootConversationId.toLowerCase() === rootConversationId?.toLowerCase()
+      : (active.rootConversationId || "").toLowerCase() === (rootConversationId || "").toLowerCase() && active.sessionId === sessionId);
+    if (action === "begin") {
+      if (!matches) {
+        assertNoRunningCurator(workspace);
+      } else if (active.expiresAt && active.expiresAt <= Date.now()) {
+        finishCuration(workspace, active, { completed: false });
+        return hostMainCuration(workspace, rootConversationId, action, params);
+      }
+      const note = matches ? active.note : "";
+      const rawPrompt = [note, typeof params.note === "string" && params.note.trim()].filter(Boolean).join("\n\n");
+      const { full } = assembleSpecPrompt({ repoRoot: workspace, cwd: workspace, role: "curator", rawPrompt, dynamicPrompt: rawPrompt,
+        controlDir: ctx.dataDir, specEnabled: true, ...curatorPromptContext(workspace, rootConversationId) });
+      const run = matches ? active : { executorKind: "host_main", runId: makeId("run_cur"), triggerSource: "host_main",
+        threadId: rootConversationId ? ctx.hostSync.findThreadByHostConversationId(rootConversationId)?.id : null };
+      if (!matches || active.awaitingHost) {
+        run.before = snapshotSpecTree(workspace);
+        Object.assign(run, { rootConversationId, sessionId, awaitingHost: false });
+        clearTimeout(run.timer);
+        delete run.expiresAt;
+        activeCurators.set(key, run);
+      }
+      return { ok: true, status: "running", workspace, runId: run.runId, prompt: full.prompt, curation: publish(workspace) };
+    }
+    if (!matches || active.awaitingHost || !active.before) throw curationError("CURATOR_SESSION_NOT_FOUND", "请先调用 spec_curation begin");
+    const error = checkCurationSnapshot(workspace, active.before);
+    if (error) {
+      finishCuration(workspace, active, { completed: false });
+      throw error;
+    }
+    const rawText = typeof params.rawText === "string" ? params.rawText : "";
+    let draft;
+    try { draft = rawText ? parseProposal(rawText) : validateDraft(params); }
+    catch (error) { throw curationError("CURATOR_INVALID_PROPOSAL", error.message); }
+    const result = finishCuration(workspace, active, { draft, rawText });
+    return { ok: true, workspace, runId: active.runId, ...result, curation: curationStatus(workspace) };
   }
 
   function writeProposal(workspace, proposal, applied) {
@@ -643,8 +812,10 @@ export function createSpecsModule(ctx) {
     const key = projectPathKey(workspace);
     const threadIds = new Set([...ctx.activeRunByThread.keys(), ...ctx.pendingTurnStartLocks,
       ...ctx.db.listThreadsWithQueuedRuns(), activeCurators.get(key)?.threadId].filter(Boolean));
+    const active = activeCurators.get(key);
+    if (active && active.executorKind !== "external_cli") finishCuration(workspace, active, { completed: false });
     const threads = [...threadIds].map(id => ctx.db.getThread(id, { includeQueue: false }))
-      .filter(thread => thread && projectPathKey(threadWorkspace(thread)) === key &&
+      .filter(thread => thread && !thread.isNativeHost && projectPathKey(threadWorkspace(thread)) === key &&
         isCuratorThread(thread, ctx.db.getRun(ctx.activeRunByThread.get(thread.id))));
     const results = await Promise.allSettled(threads.map(thread => ctx.cancellation.stopThreadExecution(thread)));
     const rejected = results.find(result => result.status === "rejected");
@@ -729,13 +900,22 @@ export function createSpecsModule(ctx) {
   async function specCuration(params = {}) {
     const { action } = params;
     if (!curatorActions.has(action)) throw curationError("INVALID_SPEC_CURATION_ACTION", "specCuration action 无效");
-    const rootConversationId = ctx.scopePolicy.policyRoot(params);
+    const rootConversationId = ctx.scopePolicy.policyRoot(
+      ["begin", "submit"].includes(action) ? ctx.scopePolicy.withDispatchConversation(params) : params);
     const boundWorkspace = rootConversationId && ctx.scopePolicy.getBoundPolicyWorkspace(rootConversationId);
     const roots = params.cwd === undefined && params.workspace === undefined && boundWorkspace
       ? { ...params, workspace: boundWorkspace } : params;
     const { repoRoot } = checkoutRoots(roots);
     const workspace = normalizeProjectPath(repoRoot);
     if (action === "status") return { ok: true, workspace, curation: curationStatus(workspace) };
+    if (action === "stopHookCheck") return stopHookCheck(workspace, rootConversationId, params);
+    if (action === "cancelTicket") {
+      const active = activeCurators.get(projectPathKey(workspace));
+      const cancelled = Boolean((active?.awaitingHost || active?.executorKind === "host_main") &&
+        (params.runId === undefined || params.runId === active.runId));
+      if (cancelled) finishCuration(workspace, active, { completed: false });
+      return { ok: true, cancelled, workspace, curation: curationStatus(workspace) };
+    }
     if (action === "setEnabled") {
       if (typeof params.enabled !== "boolean") throw curationError("INVALID_SPEC_CURATION_ACTION", "specCuration setEnabled 需要布尔值 enabled");
       await setSpecEnabled(workspace, params.enabled);
@@ -750,6 +930,7 @@ export function createSpecsModule(ctx) {
       return { ok: true, workspace, ...result, curation: publish(workspace) };
     }
     if (action !== "dismiss") assertSpecEnabled(workspace);
+    if (action === "begin" || action === "submit") return hostMainCuration(workspace, rootConversationId, action, params);
     if (action === "setAuto") {
       if (typeof params.autoTrigger !== "boolean") throw curationError("INVALID_SPEC_CURATION_ACTION", "specCuration setAuto 需要布尔值 autoTrigger");
       ctx.db.setSpecCurationAuto(workspace, params.autoTrigger);
@@ -797,9 +978,10 @@ export function createSpecsModule(ctx) {
     if (action === "revise") {
       const key = projectPathKey(workspace);
       if (revisions.has(key)) throw curationError("CURATOR_ALREADY_RUNNING", "当前项目已有提案在重拟");
-      const thread = ctx.db.getThread(proposal.threadId, { includeQueue: false });
-      if (!thread || thread.archived || !isCuratorRole(thread.role)) throw curationError("CURATOR_THREAD_UNAVAILABLE", "原维护官会话不可用");
-      if (isThreadBusyStatus(thread.status) || ctx.activeRunByThread.has(thread.id) || ctx.pendingTurnStartLocks.has(thread.id)) {
+      const thread = proposal.threadId && ctx.db.getThread(proposal.threadId, { includeQueue: false });
+      const resumeExternal = thread && !thread.isNativeHost && !thread.archived && isCuratorRole(thread.role) &&
+        (!proposal.executorKind || proposal.executorKind === "external_cli");
+      if (resumeExternal && (isThreadBusyStatus(thread.status) || ctx.activeRunByThread.has(thread.id) || ctx.pendingTurnStartLocks.has(thread.id))) {
         throw curationError("CURATOR_ALREADY_RUNNING", "原维护官会话仍在运行中");
       }
       const priorDiagnostics = [
@@ -810,6 +992,18 @@ export function createSpecsModule(ctx) {
       revisions.add(key);
       try {
         ctx.db.putSpecProposal(workspace, resolved("superseded"));
+        const note = `[上版提案摘要]\n${proposal.summary || "（无）"}\n\n[上版问题]\n${priorDiagnostics || "（无预检诊断）"}\n\n[用户打回意见]\n${params.feedback.trim()}`;
+        if (!resumeExternal) {
+          const root = rootConversationId || proposal.rootConversationId;
+          const { presets, modeProfiles } = ctx.db.getProjectRoster(workspace);
+          const { preferredKey, enabledKeys } = modeProfiles.complex.curator;
+          const nativeKey = ctx.db.getSettings(workspace).antigravityAcpMode !== "api_key" &&
+            [params.presetKey, preferredKey, ...enabledKeys].find(key => enabledKeys.includes(key) && presets[key]?.provider === "antigravity");
+          const result = nativeKey
+            ? await triggerCurator(workspace, root, "manual", { ...params, note, presetKey: nativeKey })
+            : issueHostMainRevision(workspace, root, note, params);
+          return { ...result, supersededProposalId: proposal.id };
+        }
         const result = await ctx.turns.sendToThread({ threadId: proposal.threadId, continueSession: true, _manualCurationBypass: true,
           message: `请根据以下意见重拟提案，并基于当前文件重新核对。${priorDiagnostics ? `\n\n[上版问题]\n${priorDiagnostics}` : ""}\n\n${params.feedback.trim()}` });
         if (!result?.runId) throw curationError("CURATOR_THREAD_UNAVAILABLE", "原维护官会话未启动重拟");
@@ -838,13 +1032,37 @@ export function createSpecsModule(ctx) {
     }
   }
 
+  function nativeDispatchResponse(workspace, root, result, params) {
+    if (params._standalone === true && root && (hostSettlement.get(conversationKey(root, workspace)) ??
+        ctx.hostSync.findThreadByHostConversationId(root)?.status === "completed")) {
+      void Promise.resolve().then(() => ctx.hostWakeSender({ conversationId: root, message: result.hostAction.hostPrompt,
+        agentApiExe: ctx.hostContext.agentApiExe, projectId: ctx.hostContext.projectId,
+        lsAddress: ctx.hostContext.lsAddress, csrfToken: ctx.hostContext.csrfToken,
+      })).catch(() => ctx.log("Host curation wake delivery failed"));
+    }
+    return { ...result, workspace, curation: curationStatus(workspace) };
+  }
+
+  function issueHostMainRevision(workspace, root, note, params) {
+    const handoffId = makeId("hnd");
+    const runId = makeId("run_cur");
+    const begin = { action: "begin", cwd: workspace, sessionId: `ticket:${handoffId}`, ...(root ? { conversationId: root } : {}) };
+    const hostAction = { handoffId, role: "curator",
+      hostPrompt: `[AgentTower Curation Ticket #${handoffId}] 请在当前主会话调用 spec_curation(${JSON.stringify(begin)}) 获取打回意见及只读准则，完成后用相同项目和会话参数调用 submit 提交提案。` };
+    reserveCuration(workspace, { handoffId, runId, rootConversationId: root, note, executorKind: "host_main",
+      triggerSource: "host_main", awaitingHost: true }, params.ticketTtlMs);
+    return nativeDispatchResponse(workspace, root, { ok: true, status: "waiting_host_dispatch", handoffId,
+      runId, hostAction, hostActions: [hostAction] }, params);
+  }
+
   async function triggerCurator(workspace, rootConversationId, source, params = {}, beforeStart) {
     assertCuratorAvailable(workspace);
     const note = typeof params.note === "string" ? params.note.trim() : "";
     const result = await ctx.dispatch.dispatchCurator({ cwd: workspace, conversationId: rootConversationId,
-      presetKey: params.presetKey, mode: params.mode || "async", title: "维护项目规范",
+      presetKey: params.presetKey, mode: params.mode || "async", title: "维护项目规范", ticketTtlMs: params.ticketTtlMs,
       task: `检查本项目近期变更与既有规范，按角色卡输出维护提案。${note ? `\n补充说明：${note}` : ""}` }, source, beforeStart);
     if (!result) return null;
+    if (result.status === "waiting_host_dispatch") return nativeDispatchResponse(workspace, rootConversationId, result, params);
     const { taskId, threadId, runId, status } = result;
     return { ok: true, taskId, threadId, runId, status: ctx.db.getRun(runId)?.status || status, workspace,
       curation: curationStatus(workspace) };
@@ -853,54 +1071,96 @@ export function createSpecsModule(ctx) {
   const threadWorkspace = thread => normalizeProjectPath(thread.meta?.projectRoot || thread.workspace || thread.cwd);
   const conversationKey = (root, workspace) => `${projectPathKey(workspace)}\0${root.toLowerCase()}`;
 
+  function preferredCurator(workspace) {
+    const { presets, modeProfiles } = ctx.db.getProjectRoster(workspace);
+    const { preferredKey, enabledKeys } = modeProfiles.complex.curator;
+    return presets[preferredKey || enabledKeys[0]];
+  }
+
+  function usesNativeCurator(workspace) {
+    return preferredCurator(workspace)?.provider === "antigravity" &&
+      ctx.db.getSettings(workspace).antigravityAcpMode !== "api_key";
+  }
+
+  function autoCurationReady(root, workspace, nativeStop) {
+    const { enabled, autoTrigger } = ctx.db.getProjectSpec(workspace);
+    return enabled && autoTrigger && !ctx.flags.shuttingDown && !ctx.updates.isUpdating() &&
+      ctx.scopePolicy.readConversationPolicy(root).orchestrationMode === "complex" &&
+      preferredCurator(workspace) && usesNativeCurator(workspace) === nativeStop &&
+      !activeCurators.has(projectPathKey(workspace)) && !revisions.has(projectPathKey(workspace)) &&
+      !ctx.db.readSpecCuration(workspace).pendingProposal && !inFlightAutoWaterlines.has(conversationKey(root, workspace));
+  }
+
+  function eligibleAutoWork(root, workspace, nativeStop) {
+    const key = conversationKey(root, workspace);
+    if (!autoCurationReady(root, workspace, nativeStop)) return;
+    const threads = ctx.db.listThreads({ workspace, includeSubagents: true, includeQueue: false, limit: 1000 })
+      .filter(thread => projectPathKey(threadWorkspace(thread)) === projectPathKey(workspace) &&
+        ctx.scopePolicy.threadPolicyRoot(thread).toLowerCase() === root.toLowerCase());
+    const snapshot = ctx.latestSwarmSnapshots.get(root) || ctx.latestSwarmSnapshots.get(root.toLowerCase());
+    const hostThread = ctx.hostSync.findThreadByHostConversationId(root);
+    const nativeRoot = hostThread?.isNativeHost ? hostThread : null;
+    if (!nativeStop && (nativeRoot || snapshot || hostSettlement.has(key) || ctx.hostSync.nativeTranscriptAvailable(root)) &&
+        hostSettlement.get(key) !== true) return;
+    if (ctx.dispatch.findNativeHandoff({ rootConversationId: root }) ||
+        snapshot?.members?.some(member => !member.killed && ["working", "running"].includes(String(member.state).toLowerCase()) &&
+          (!nativeStop || member.role !== "coordinator" && String(member.conversation_id || "").toLowerCase() !== root.toLowerCase()))) return;
+    const counts = ctx.scopePolicy.conversationWorkCounts(root);
+    if (counts.runningCount || counts.queuedCount || threads.some(thread =>
+        thread.id !== nativeRoot?.id && (isThreadBusyStatus(thread.status) || ctx.pendingTurnStartLocks.has(thread.id)))) return;
+    const scopedIds = new Set(threads.map(thread => thread.id));
+    if (ctx.db.listPendingRequests({ workspace }).some(request => scopedIds.has(request.threadId))) return;
+    const last = ctx.db.readSpecCuration(workspace).autoWaterlines?.[root.toLowerCase()] || {};
+    const waterline = ctx.db.latestCurationWork(workspace, root);
+    if (!waterline || waterline.completedAt < (last.completedAt || 0) ||
+        (waterline.completedAt === last.completedAt && waterline.id <= last.id) ||
+        failedAutoWaterlines.get(key) === `${waterline.completedAt}:${waterline.id}`) return;
+    return { threads, waterline };
+  }
+
+  async function triggerAuto(root, workspace, nativeStop, current = () => true, params = {}) {
+    const key = conversationKey(root, workspace);
+    let reserved;
+    try {
+      if (!current() || !(nativeStop ? autoCurationReady(root, workspace, true) : eligibleAutoWork(root, workspace, false))) return;
+      return await triggerCurator(workspace, root, "auto", params, async native => {
+        if (native !== nativeStop) return false;
+        if (ctx.hostSync.nativeTranscriptAvailable(root)) await ctx.hostSync.syncNativeHostConversation(root, { workspace });
+        const work = current() && eligibleAutoWork(root, workspace, nativeStop);
+        if (!work || await ctx.worktrees.hasUnintegratedWorktree(work.threads, workspace)) return false;
+        const checked = current() && eligibleAutoWork(root, workspace, nativeStop);
+        if (!checked || checked.waterline.id !== work.waterline.id ||
+            checked.waterline.completedAt !== work.waterline.completedAt) return false;
+        reserved = checked.waterline;
+        inFlightAutoWaterlines.set(key, reserved);
+        return true;
+      });
+    } finally {
+      if (reserved && inFlightAutoWaterlines.get(key) === reserved &&
+          activeCurators.get(projectPathKey(workspace))?.triggerSource !== "auto") {
+        inFlightAutoWaterlines.delete(key);
+      }
+    }
+  }
+
+  async function stopHookCheck(workspace, root, params) {
+    const caller = String(params.conversationId || "").trim().toLowerCase();
+    if (!root || caller !== root.toLowerCase() || ctx.db.isManagedChildSession(caller) || params.continuationActive === true) return {};
+    const resolved = await triggerAuto(root, workspace, true, undefined, { ticketTtlMs: params.ticketTtlMs });
+    if (!resolved?.hostAction) return {};
+    return { decision: "continue", reason: `[AgentTower Auto-Curation] ${resolved.hostAction.hostPrompt}` };
+  }
+
   function scheduleAuto(root, workspace) {
     if (!root || !workspace || ctx.flags.shuttingDown || ctx.updates.isUpdating() ||
         ctx.scopePolicy.readConversationPolicy(root).orchestrationMode !== "complex" ||
-        !ctx.db.getProjectSpec(workspace).autoTrigger) return;
+        !ctx.db.getProjectSpec(workspace).autoTrigger || usesNativeCurator(workspace)) return;
     const key = conversationKey(root, workspace);
     clearTimeout(autoTimers.get(key));
     const timer = setTimeout(async () => {
-      try {
-        let waterline;
-        const eligible = () => {
-          if (ctx.flags.shuttingDown || ctx.updates.isUpdating() || autoTimers.get(key) !== timer ||
-              ctx.scopePolicy.readConversationPolicy(root).orchestrationMode !== "complex") return false;
-          const { running, autoTrigger, pendingProposal } = curationStatus(workspace);
-          if (!autoTrigger || running || pendingProposal || revisions.has(projectPathKey(workspace))) return false;
-          if (!ctx.db.getProjectRoster(workspace).modeProfiles.complex.curator.enabledKeys.length) return false;
-          const threads = ctx.db.listThreads({ workspace, includeSubagents: true, includeQueue: false, limit: 1000 })
-            .filter(thread => projectPathKey(threadWorkspace(thread)) === projectPathKey(workspace) &&
-              ctx.scopePolicy.threadPolicyRoot(thread).toLowerCase() === root.toLowerCase());
-          const snapshot = ctx.latestSwarmSnapshots.get(root) || ctx.latestSwarmSnapshots.get(root.toLowerCase());
-          const hostThread = ctx.hostSync.findThreadByHostConversationId(root);
-          const nativeRoot = hostThread?.isNativeHost ? hostThread : null;
-          if ((nativeRoot || snapshot || hostSettlement.has(key) || ctx.hostSync.nativeTranscriptAvailable(root)) &&
-              hostSettlement.get(key) !== true) return false;
-          if (ctx.dispatch.findNativeHandoff({ rootConversationId: root }) ||
-              snapshot?.members?.some(member => !member.killed && String(member.state).toLowerCase() === "working")) return false;
-          const counts = ctx.scopePolicy.conversationWorkCounts(root);
-          if (counts.runningCount || counts.queuedCount || threads.some(thread =>
-              thread.id !== nativeRoot?.id && (isThreadBusyStatus(thread.status) || ctx.pendingTurnStartLocks.has(thread.id)))) return false;
-          const scopedIds = new Set(threads.map(thread => thread.id));
-          if (ctx.db.listPendingRequests({ workspace }).some(request => scopedIds.has(request.threadId))) return false;
-          const last = ctx.db.readSpecCuration(workspace).autoWaterlines?.[root.toLowerCase()] || {};
-          waterline = ctx.db.latestCurationWork(workspace, root);
-          if (!waterline || (waterline.completedAt < (last.completedAt || 0)) ||
-              (waterline.completedAt === last.completedAt && waterline.id <= last.id)) return false;
-          if (inFlightAutoWaterlines.has(key) || failedAutoWaterlines.get(key) === `${waterline.completedAt}:${waterline.id}`) return false;
-          return threads;
-        };
-        if (!eligible()) return;
-        await triggerCurator(workspace, root, "auto", {}, async () => {
-          if (ctx.hostSync.nativeTranscriptAvailable(root)) await ctx.hostSync.syncNativeHostConversation(root, { workspace });
-          const threads = eligible();
-          if (!threads || await ctx.worktrees.hasUnintegratedWorktree(threads, workspace) || !eligible()) return false;
-          inFlightAutoWaterlines.set(key, waterline);
-          return true;
-        });
-      } catch (error) {
-        ctx.log(`自动规范维护未启动：${error.message}`);
-      } finally { if (autoTimers.get(key) === timer) autoTimers.delete(key); }
+      try { await triggerAuto(root, workspace, false, () => autoTimers.get(key) === timer); }
+      catch (error) { ctx.log(`自动规范维护未启动：${error.message}`); }
+      finally { if (autoTimers.get(key) === timer) autoTimers.delete(key); }
     }, 220);
     timer.unref();
     autoTimers.set(key, timer);
@@ -939,6 +1199,9 @@ export function createSpecsModule(ctx) {
   function stopAutoCuration() {
     for (const timer of autoTimers.values()) clearTimeout(timer);
     autoTimers.clear();
+    if (ctx.flags.shuttingDown) {
+      for (const active of activeCurators.values()) clearTimeout(active.timer);
+    }
   }
 
   function syncScaffold(top, inventory) {
@@ -1103,5 +1366,5 @@ export function createSpecsModule(ctx) {
 
   return { listProjectSpecs, initProjectSpecs, projectSpecsSummary, prepareTurn, specCuration, curationStatus,
     assertSpecEnabled, assertCuratorAvailable, isCuratorThread, startCurator, onWorkStarted, onWorkSettled, onHostSettlement, stopAutoCuration,
-    scheduleAuto };
+    curatorPromptContext, issueNativeCuration, admitNativeCuration, claimNativeCuration, observeNativeCuration, scheduleAuto };
 }

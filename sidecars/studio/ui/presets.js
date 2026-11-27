@@ -89,8 +89,8 @@ export function roleForMemberGroup(group) {
   return group === 'reviewer' ? 'review' : group === 'advisor' ? 'design' : group === 'curator' ? 'curator' : 'implementation';
 }
 /**
- * v0.2.11 规范维护组只读硬锁：引擎排除宿主原生（回落 codex）、权限跟随引擎锁定 read-only（Codex）/ plan（其余外部引擎）、
- * Plan 交互、共享目录；返回被修正的字段名（服务端在启动 / 排队 / 续聊全链路同样强制锁定，前端仅做一致展示）。
+ * v0.2.11+ 规范维护组只读硬锁：支持外部 CLI 与宿主原生（antigravity），仅对空值或内部伪 ID 回落 codex；
+ * 权限跟随引擎锁定 read-only（Codex）/ plan（其余含 antigravity）、Plan 交互、共享目录；返回被修正的字段名。
  */
 export function applyCuratorLocks(preset) {
   if (!preset) return [];

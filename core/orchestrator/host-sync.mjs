@@ -136,6 +136,7 @@ export function createHostSyncModule(ctx) {
       subagentName = "",
       memberName = "",
       role = "",
+      curationPrompt,
       model = "",
       status = "",
       swarmState = "",
@@ -188,7 +189,7 @@ export function createHostSyncModule(ctx) {
       ? ctx.dispatch?.claimNativeHandoff({ rootConversationId: rootConvId, presetKey: matched?.key || "",
         swarmName: isSwarmMember ? shortName : "", label: !isSwarmMember ? shortName : "",
         nativeKind: isSwarmMember || existing?.meta?.isSwarmMember ? "swarm" : "subagent",
-        conversationId: cleanConvId }) : null;
+        conversationId: cleanConvId, swarmState, curationPrompt }) : null;
     const activePreset = matched || (claimed?.presetKey && Object.hasOwn(presets, claimed.presetKey) ? presets[claimed.presetKey] : undefined);
     const knownRole = ["commander", "advisor", "executor", "review", "reviewer", "research", "general"].includes(String(role || "").toLowerCase()) ? role : "";
 
@@ -204,9 +205,9 @@ export function createHostSyncModule(ctx) {
       provider: "antigravity",
       model: model || claimed?.requestedModel || activePreset?.model || existing?.model || (isSubagent ? "gemini-4-hydrogen" : "gemini-4-carbon"),
       effort: activePreset ? activePreset.effort || "high" : existing?.effort || "medium",
-      permissionMode: existing?.permissionMode || "auto-accept-edits",
-      interactionMode: existing?.interactionMode || "default",
-      isolation: "local",
+      permissionMode: claimed?.role === "curator" ? "plan" : existing?.permissionMode || "auto-accept-edits",
+      interactionMode: claimed?.role === "curator" ? "plan" : existing?.interactionMode || "default",
+      isolation: claimed?.role === "curator" ? "shared" : "local",
       status: killed ? "interrupted" : status || existing?.status || "completed",
       ...(killed ? { archived: true } : {}),
       workspace: normWs,
@@ -224,6 +225,7 @@ export function createHostSyncModule(ctx) {
         ...(normWs ? { projectRoot: normWs } : {}),
       },
     });
+    if (claimed?.role === "curator") ctx.specs.observeNativeCuration(claimed, thread, {});
     if (activePreset || claimed) archiveSupersededNativePlaceholders(thread, rootConvId, activePreset?.key || claimed?.presetKey || "");
 
     if (killed) {
@@ -267,6 +269,9 @@ export function createHostSyncModule(ctx) {
       String(ctx.scopePolicy.threadPolicyRoot(thread) || "").toLowerCase() === String(root).toLowerCase() &&
       !present.has(String(thread.nativeSessionId || thread.hostConversationId || "").toLowerCase()));
     for (const thread of missing) {
+      const ticket = ctx.dispatch.findNativeHandoff({ rootConversationId: root, nativeKind: "swarm",
+        conversationId: thread.hostConversationId, includeClaimed: true, role: "curator" });
+      if (ticket) ctx.specs.observeNativeCuration(ticket, thread, { settled: true, cancelled: true });
       const archived = ctx.db.upsertThread({ id: thread.id, archived: true, activeRunId: null,
         meta: { leftSwarm: true, leftSwarmAt: Date.now() } });
       ctx.context.emitEvent({ type: "thread_archived", threadId: thread.id, rootConversationId: root,
@@ -318,6 +323,33 @@ export function createHostSyncModule(ctx) {
     }
     reconcileMissingSwarmMembers(swarmSnap);
     return normWs;
+  }
+
+  function observeSwarmCuration(swarm) {
+    for (const member of swarm.members || []) {
+      const conversationId = member.conversation_id;
+      if (!conversationId) continue;
+      let ticket = ctx.dispatch.findNativeHandoff({ rootConversationId: swarm.rootConversationId,
+        conversationId, nativeKind: "swarm", includeClaimed: true });
+      const postFor = candidate => (swarm.messages || []).findLast(message => message.seq > candidate.boardHead &&
+        message.agent.toLowerCase() === member.name.toLowerCase() &&
+        /@coordinator\s+\[done\]|agent-tower-spec-proposal/i.test(message.text));
+      if (!ticket) {
+        const waitingTicket = ctx.dispatch.findNativeHandoff({ rootConversationId: swarm.rootConversationId,
+          swarmName: member.name, nativeKind: "swarm", role: "curator" });
+        if (waitingTicket?.residentConversationId?.toLowerCase() === conversationId.toLowerCase() && postFor(waitingTicket)) {
+          ticket = ctx.dispatch.claimNativeHandoff({ rootConversationId: swarm.rootConversationId,
+            conversationId, swarmName: member.name, nativeKind: "swarm", freshOutput: true });
+        }
+      }
+      if (ticket?.role !== "curator") continue;
+      const thread = findThreadByHostConversationId(conversationId);
+      if (!thread) continue;
+      const post = postFor(ticket);
+      const waiting = String(member.state).toLowerCase() === "waiting";
+      ctx.specs.observeNativeCuration(ticket, thread, { rawText: post?.text,
+        waiting, cancelled: member.killed, settled: member.killed || waiting && Boolean(post) });
+    }
   }
 
   function syncNativeTurnTiming(thread, timing, workspace = "") {
@@ -395,7 +427,8 @@ export function createHostSyncModule(ctx) {
       const swarmSnap = readNativeSwarmSnapshot({ conversationId: convId, appDataDir: resolvedAppData });
       const normWs = nativeWorkspace(rootConvId, workspace);
       const hasInitializedDb = Boolean(normWs && existsSync(path.join(normWs, ".agent-tower", "conversations", "tower.sqlite")));
-      if (!existingThread && !hasInitializedDb && policy.source !== "explicit" && policy.orchestrationMode === "direct" && !swarmSnap?.found) {
+      if (!existingThread && !hasInitializedDb && policy.source !== "explicit" && policy.orchestrationMode === "direct" && !swarmSnap?.found &&
+          !ctx.dispatch.findNativeHandoff({ rootConversationId: rootConvId, role: "curator", includeClaimed: true })) {
         const passiveKey = `${resolvedAppData}\0${convId.toLowerCase()}`;
         const passiveSnap = await readNativeTranscriptSnapshot({
           appDataDir: resolvedAppData,
@@ -443,6 +476,7 @@ export function createHostSyncModule(ctx) {
             subagentName: sub.subagentName,
             memberName: sub.memberName || sub.subagentName,
             role: sub.role,
+            curationPrompt: sub.isSwarmMember ? undefined : sub.prompt,
             model: sub.model,
             killed: sub.killed === true,
             status: sub.state ? mapSwarmStateToThreadStatus(sub.state) : "",
@@ -477,7 +511,10 @@ export function createHostSyncModule(ctx) {
                 })),
               },
             });
-            if (!initialCatchup) ctx.specs.scheduleAuto(ev.swarm.rootConversationId || rootConvId, projectWorkspace);
+            if (!initialCatchup) {
+              observeSwarmCuration(ev.swarm);
+              ctx.specs.scheduleAuto(ev.swarm.rootConversationId || rootConvId, projectWorkspace);
+            }
             return;
           }
 
@@ -495,6 +532,17 @@ export function createHostSyncModule(ctx) {
             workspace,
           });
           if (t.archived) return;
+          const curationTicket = !initialCatchup && targetConvId.toLowerCase() !== rootConvId.toLowerCase() &&
+            ctx.dispatch.findNativeHandoff({ rootConversationId: rootConvId, conversationId: targetConvId, includeClaimed: true });
+          if (curationTicket?.role === "curator") {
+            const startedAt = curationTicket.admittedAt || curationTicket.createdAt;
+            if (ev.type === "message_delta" && (ev.text || ev.delta) && ev.timestamp >= startedAt) {
+              ctx.specs.observeNativeCuration(curationTicket, t, { rawText: String(ev.text || ev.delta) });
+            } else if (ev.type === "settle_state" && ev.settled && (ev.turnCompletedAt || ev.timestamp) >= startedAt) {
+              ctx.specs.observeNativeCuration(curationTicket, t, curationTicket.nativeKind === "subagent"
+                ? { settled: true } : { transcriptSettled: true });
+            }
+          }
           const runId = `run_native_${targetConvId}`;
           const ws = t.meta?.workspace || t.cwd;
           syncNativeTurnTiming(t, ev, ws);
@@ -712,6 +760,7 @@ export function createHostSyncModule(ctx) {
     });
     if (swarmSnap?.found) {
       materializeSwarmSnapshotThreads(swarmSnap, workspace, resolvedAppData);
+      observeSwarmCuration(swarmSnap);
     }
 
     if (snap?.found) {

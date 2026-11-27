@@ -121,13 +121,15 @@ test("第 4 组 curator：常量、种子、modeProfiles 归一化与派发池�
     ["curator", "curator", "codex", "gpt-6.2-astra", "high", "read-only", "plan", "shared", "规范维护官 · GPT-6.2 Astra"]);
   assert.deepEqual(S.normalizeClientModeProfiles(null, null), S.DEFAULT_MODE_PROFILES, "离线默认与归一化结果一致");
 
-  // 远端旧结构（无 curator）→ 按成员池迁移；宿主原生成员不得进入规范维护组勾选池；★ 不在勾选池时回落首位
+  // 远端旧结构（无 curator）→ 按成员池迁移；放行宿主原生 antigravity / agy 维护官，仅拦截内部伪 ID（host）与跨组成员
   state.presets.curator_agy = { key: "curator_agy", group: "curator", label: "AGY", provider: "antigravity", model: "gemini-4-argon" };
-  const norm = S.normalizeClientModeProfiles({ complex: { curator: { enabledKeys: ["curator_agy", "curator_codex", "executor_codex", "ghost"], preferredKey: "curator_agy" } } }, state.presets);
-  assert.deepEqual(norm.complex.curator, { enabledKeys: ["curator_codex"], preferredKey: "curator_codex" });
+  state.presets.curator_bad = { key: "curator_bad", group: "curator", label: "BAD", provider: "host", model: "gemini-4-argon" };
+  const norm = S.normalizeClientModeProfiles({ complex: { curator: { enabledKeys: ["curator_bad", "curator_agy", "curator_codex", "executor_codex", "ghost"], preferredKey: "curator_agy" } } }, state.presets);
+  assert.deepEqual(norm.complex.curator, { enabledKeys: ["curator_agy", "curator_codex"], preferredKey: "curator_agy" });
   assert.equal(norm.complex.advisor.stageEnabled, true);
   assert.ok(!("stageEnabled" in norm.complex.curator));
   delete state.presets.curator_agy;
+  delete state.presets.curator_bad;
 
   // 规范维护组不是派发阶段：不进派发勾选池 / 底栏下拉 / 阵容微摘要
   assert.equal(S.isModeStageEnabled("complex", "curator"), false);
@@ -138,19 +140,27 @@ test("第 4 组 curator：常量、种子、modeProfiles 归一化与派发池�
   assert.ok(S.ROLE_SLOT_META.some((s) => s.key === "curator_codex") && S.MEMBER_GROUPS.every((x) => x.keys.every((k) => S.seedGroupOf(k) === x.id)));
 });
 
-test("规范维护组排除宿主原生、权限 / 隔离跟随引擎锁定，模型 / 强度 / ★ / 删除保持平权", () => {
+test("规范维护组放行宿主原生、权限 / 隔离跟随引擎锁定，模型 / 强度 / ★ / 新增 / 删除保持平权", () => {
   resetAll();
   const ids = C.curatorProviderOptions().map((o) => o.value);
-  assert.ok(ids.includes("codex") && ids.includes("claude-code") && ids.includes("kimi-code"));
-  assert.ok(!ids.includes("antigravity"), "引擎下拉过滤宿主原生");
+  assert.equal(S.isCuratorBlockedProvider(" "), true);
+  assert.ok(ids.includes("codex") && ids.includes("claude-code") && ids.includes("kimi-code") && ids.includes("antigravity"), "引擎下拉同时包含外部 CLI 与宿主原生 antigravity");
 
-  C.editRolePreset("curator_codex", "provider", "antigravity");
-  assert.equal(state.presets.curator_codex.provider, "codex");
-  assert.match(toasts.at(-1), /不支持宿主原生引擎/);
   C.editRolePreset("curator_codex", "permissionMode", "full-access");
   C.editRolePreset("curator_codex", "isolation", "worktree");
   assert.deepEqual([state.presets.curator_codex.permissionMode, state.presets.curator_codex.isolation], ["read-only", "shared"]);
   assert.match(toasts.at(-1), /权限与目录隔离跟随引擎自动锁定/);
+
+  // 切换为宿主原生 antigravity：放行并锁定 plan + shared
+  C.editRolePreset("curator_codex", "provider", "antigravity");
+  const agy = state.presets.curator_codex;
+  assert.deepEqual([agy.provider, agy.permissionMode, agy.interactionMode, agy.isolation], ["antigravity", "plan", "plan", "shared"], "宿主原生维护官锁 plan + shared");
+  assert.ok(agy.model, "换为 antigravity 后模型自动对齐");
+  state.openMemberKey = "curator_codex";
+  const agyDrawer = gridHtml().slice(gridHtml().indexOf('data-member-drawer="curator_codex"'));
+  assert.match(agyDrawer.slice(0, agyDrawer.indexOf("</select>")), /value="antigravity" selected/);
+  assert.match(agyDrawer, /data-curator-locked="permissionMode"[^>]*>🔒 只读沙盒 \/ Hook 门禁 \(plan\)/);
+  assert.doesNotMatch(agyDrawer, /已排除宿主原生/);
 
   C.editRolePreset("curator_codex", "provider", "claude-code");
   const p = state.presets.curator_codex;
@@ -161,19 +171,36 @@ test("规范维护组排除宿主原生、权限 / 隔离跟随引擎锁定，�
   C.editRolePreset("curator_codex", "provider", "codex");
   assert.deepEqual([state.presets.curator_codex.permissionMode, state.presets.curator_codex.interactionMode], ["read-only", "plan"]);
 
-  // 新建草稿：模板为宿主原生时回落 codex + 只读锁
-  const locked = { provider: "antigravity", model: "gemini-4-argon", permissionMode: "always-proceed", interactionMode: "default", isolation: "worktree" };
-  assert.deepEqual(P.applyCuratorLocks(locked).sort(), ["interactionMode", "isolation", "model", "permissionMode", "provider"]);
-  assert.deepEqual([locked.provider, locked.permissionMode, locked.interactionMode, locked.isolation], ["codex", "read-only", "plan", "shared"]);
+  // applyCuratorLocks：antigravity 保留并锁 plan + shared；仅内部伪 ID（host）回落 codex
+  const agyLocked = { provider: "antigravity", model: "gemini-4-argon", permissionMode: "always-proceed", interactionMode: "default", isolation: "worktree" };
+  assert.deepEqual(P.applyCuratorLocks(agyLocked).sort(), ["interactionMode", "isolation", "permissionMode"]);
+  assert.deepEqual([agyLocked.provider, agyLocked.permissionMode, agyLocked.interactionMode, agyLocked.isolation], ["antigravity", "plan", "plan", "shared"]);
+  const badLocked = { provider: "host", model: "gemini-4-argon", permissionMode: "always-proceed", interactionMode: "default", isolation: "worktree" };
+  assert.deepEqual(P.applyCuratorLocks(badLocked).sort(), ["interactionMode", "isolation", "model", "permissionMode", "provider"]);
+  assert.deepEqual([badLocked.provider, badLocked.permissionMode, badLocked.interactionMode, badLocked.isolation], ["codex", "read-only", "plan", "shared"]);
   const draft = P.newCustomPresetBase("curator");
   assert.deepEqual([draft.group, draft.role, draft.permissionMode, draft.interactionMode, draft.isolation], ["curator", "curator", "read-only", "plan", "shared"]);
 
-  // 抽屉：原生 select 已排除 antigravity，权限 / 隔离为锁定提示（不渲染可编辑触发器 / 分段）
+  // 新增并保存 antigravity 规范维护官草稿：自动勾选进 complex.curator 且锁定 plan + shared
+  C.startAddMember("curator");
+  C.updateMemberDraftField("label", "原生维护官");
+  C.updateMemberDraftField("key", "curator_agy");
+  C.editRolePreset(S.MEMBER_DRAFT_KEY, "provider", "antigravity");
+  C.confirmAddMember();
+  assert.deepEqual(
+    [state.presets.curator_agy.provider, state.presets.curator_agy.permissionMode, state.presets.curator_agy.interactionMode, state.presets.curator_agy.isolation],
+    ["antigravity", "plan", "plan", "shared"],
+  );
+  assert.ok(state.modeProfiles.complex.curator.enabledKeys.includes("curator_agy"));
+  delete state.presets.curator_agy;
+  state.modeProfiles.complex.curator.enabledKeys = state.modeProfiles.complex.curator.enabledKeys.filter((k) => k !== "curator_agy");
+
+  // 抽屉：原生 select 包含 antigravity，权限 / 隔离为锁定提示（不渲染可编辑触发器 / 分段）
   state.openMemberKey = "curator_codex";
   const html = gridHtml();
   const drawer = html.slice(html.indexOf('data-member-drawer="curator_codex"'));
   assert.match(drawer, /<select class="compact-select ps-curator-provider" data-curator-provider="curator_codex"/);
-  assert.doesNotMatch(drawer.slice(0, drawer.indexOf("</select>")), /value="antigravity"/);
+  assert.match(drawer.slice(0, drawer.indexOf("</select>")), /value="antigravity"/);
   assert.match(drawer, /data-curator-locked="permissionMode"[^>]*>🔒 只读沙盒 \(read-only\)/);
   assert.match(drawer, /data-curator-locked="isolation"/);
   assert.doesNotMatch(drawer, /data-ps-field="permissionMode"|data-ps-seg="curator_codex"/);
@@ -358,10 +385,11 @@ test("整组提案确认卡：四要素直出、Diff / 新正文折叠、预检�
   C.setSpecCurationDetailOpen("diff:0", true);
   assert.match(panelHtml(), /data-curation-details="diff:0" open>/, "折叠展开态跨重绘保持");
 
-  // 打回：意见为空本地拦截；填写后 revise → 旧卡移除、梳理中
-  C.toggleSpecProposalRevise(true);
+  // 打回：修改建议输入框默认常驻直出（无需二次点开）；意见为空本地拦截并聚焦；填写后 revise → 旧卡移除、梳理中
   html = panelHtml();
+  assert.match(html, /<label class="pool-field-lbl" for="inp-curation-feedback-sprop_1">修改建议<\/label>/);
   assert.match(html, /<input type="text" class="text-input ps-curation-input" data-curation-input="feedback"/);
+  assert.match(html, /data-curation-revise-submit="sprop_1"[^>]*>按意见打回重拟<\/button>/);
   assert.doesNotMatch(html, /<textarea\b/i);
   rpcLog.length = 0;
   assert.equal(await C.submitSpecProposalRevise("sprop_1"), false);
@@ -425,10 +453,11 @@ test("待办提醒一键定位、维护组卡头提示与静态契约（23 模�
   assert.match(events, /\[data-curation-auto-toggle\][\s\S]*toggleSpecCurationAuto/);
   assert.match(events, /btn-spec-curation-auto[\s\S]*toggleSpecCurationAuto/);
   assert.match(events, /btn-spec-curation-trigger[\s\S]*toggleSpecCurationTriggerBar/);
+  assert.match(events, /\[data-curation-cancel-ticket\][\s\S]*cancelSpecCurationTicket/);
   const css = read("styles.css");
   const curationCss = css.slice(css.indexOf("v0.2.11 专职规范维护官"));
   assert.doesNotMatch(curationCss, /var\(--(?!sw-|r-|text-)/, "新样式仅用内部 --sw-* 色板");
-  for (const sel of [".pool-curator-row", ".ps-curation-head", ".ps-curation-card", ".ps-curation-inline", ".ps-curation-pre"]) assert.ok(curationCss.includes(sel), sel);
+  for (const sel of [".pool-curator-row", ".ps-curation-head", ".ps-curation-card", ".ps-curation-inline", ".ps-curation-pre", ".ps-curation-status--row"]) assert.ok(curationCss.includes(sel), sel);
   assert.match(curationCss, /\.ps-curation-head \{[^}]*flex-wrap: wrap;[^}]*min-width: 0;/);
   assert.match(curationCss, /\.ps-curation-pre \{[^}]*white-space: pre-wrap;/);
 });
@@ -511,4 +540,100 @@ test("项目规范顶栏：按项目独立设置单篇与总上限（已用展�
   assert.deepEqual(methods(), ["specCuration:setLimits", "listProjectSpecs"]);
   assert.deepEqual([S.currentSpecCuration().singleMaxKb, S.currentSpecCuration().totalMaxKb], [6, 12]);
   assert.equal(els.get("spec-quota-used").classList.contains("is-over"), true, "15 KB > 12 KB 标红提示");
+});
+
+test("原生维护票据代派（trigger / revise）、剪贴板降级、awaitingHost 等待与 cancelTicket 及 host_main 提案来源", async () => {
+  resetAll();
+  const sentMessages = [];
+  const copiedTexts = [];
+  const prevAgent = globalThis.window.sidecar.agent;
+  const prevClipboardDesc = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+  try {
+    // 1) 宿主内 trigger 返回 hostActions → 自动经 window.sidecar.agent.sendMessage 推入主对话，并进入 awaitingHost 等待态
+    globalThis.window.sidecar.agent = {
+      sendMessage: async (msg, convId) => { sentMessages.push({ msg, convId }); },
+    };
+    rpcHandler = (_method, params) => {
+      if (params.action === "trigger") {
+        return {
+          ok: true,
+          status: "waiting_host_dispatch",
+          handoffId: "hnd_cur_1",
+          runId: "run_cur_1",
+          hostActions: [{ hostPrompt: "[AgentTower Curation Ticket #hnd_cur_1] 请启动原生规范维护" }],
+          curation: curation({ running: true, awaitingHost: true, activeHandoffId: "hnd_cur_1", activeExecutorKind: "antigravity_subagent", activeRunId: "run_cur_1" }),
+        };
+      }
+      if (params.action === "cancelTicket") {
+        return { ok: true, workspace: WORKSPACE, curation: curation({ running: false, awaitingHost: false, activeHandoffId: null, activeExecutorKind: null }) };
+      }
+      return {};
+    };
+    assert.equal(await C.submitSpecCurationTrigger(), true);
+    assert.equal(sentMessages.length, 1);
+    assert.deepEqual(sentMessages[0], { msg: "[AgentTower Curation Ticket #hnd_cur_1] 请启动原生规范维护", convId: "conv-curator" });
+    assert.match(toasts.at(-1), /已发送至当前主对话启动只读梳理/);
+    assert.deepEqual([S.currentSpecCuration().awaitingHost, S.currentSpecCuration().activeHandoffId, S.currentSpecCuration().activeExecutorKind], [true, "hnd_cur_1", "antigravity_subagent"]);
+
+    C.renderSpecCurationSection();
+    assert.equal(els.get("btn-spec-curation-trigger").textContent, "等待宿主…");
+    assert.equal(els.get("btn-spec-curation-trigger").disabled, true);
+    const waitHtml = els.get("spec-curation-panel").innerHTML;
+    assert.match(waitHtml, /role="status" data-curation-awaiting-host/);
+    assert.match(waitHtml, /⏳ 等待宿主执行维护票据…/);
+    assert.match(waitHtml, /<button type="button" class="ghost-xs-btn" data-curation-cancel-ticket data-fk="curation:cancel-ticket">取消等待<\/button>/);
+
+    // 2) cancelSpecCurationTicket → 调用 action: 'cancelTicket' 并释放等待态
+    rpcLog.length = 0;
+    assert.equal(await C.cancelSpecCurationTicket(), true);
+    assert.deepEqual(rpcLog.at(-1), { method: "specCuration", params: { conversationId: "conv-curator", workspace: WORKSPACE, action: "cancelTicket", cwd: WORKSPACE, runId: "run_cur_1" } });
+    assert.equal(S.currentSpecCuration().awaitingHost, false);
+    assert.equal(S.currentSpecCuration().running, false);
+    C.renderSpecCurationSection();
+    assert.equal(els.get("btn-spec-curation-trigger").textContent, "✨ 维护规范");
+    assert.doesNotMatch(els.get("spec-curation-panel").innerHTML, /data-curation-cancel-ticket/);
+    // 非 awaitingHost 状态再调 cancelSpecCurationTicket 不发 RPC
+    const beforeNoop = rpcLog.length;
+    assert.equal(await C.cancelSpecCurationTicket(), false);
+    assert.equal(rpcLog.length, beforeNoop);
+
+    S.applySpecCurationPayload(curation({ running: true, activeExecutorKind: "host_main", activeRunId: "run_host" }));
+    assert.match(panelHtml(), /data-curation-cancel-ticket/);
+    rpcHandler = () => ({ cancelled: false, curation: curation() });
+    assert.equal(await C.cancelSpecCurationTicket(), false);
+    assert.doesNotMatch(toasts.at(-1), /已取消/);
+
+    // 3) host_main 提案来源展示 + 独立网页降级复制（revise 返回 hostActions 时无 sidecar.agent → 复制到剪贴板）
+    S.applySpecCurationPayload(curation({ pendingProposal: proposal({ id: "sprop_host", triggerSource: "host_main", executorKind: "host_main" }) }));
+    const hostCard = panelHtml();
+    assert.match(hostCard, /2 处变更 · 主会话提案/);
+    assert.equal(S.currentSpecCuration().pendingProposal.executorKind, "host_main");
+
+    delete globalThis.window.sidecar.agent;
+    Object.defineProperty(globalThis, "navigator", {
+      configurable: true,
+      value: { clipboard: { writeText: async (text) => { copiedTexts.push(text); } } },
+    });
+    C.toggleSpecProposalRevise(true);
+    C.updateSpecCurationDraft("feedback", "请精简第 2 条");
+    rpcHandler = (_method, params) => (params.action === "revise" ? {
+      ok: true,
+      status: "waiting_host_dispatch",
+      handoffId: "hnd_rev_2",
+      runId: "run_rev_2",
+      hostActions: [{ hostPrompt: "[AgentTower Curation Ticket #hnd_rev_2] 请按意见重拟：请精简第 2 条" }],
+      curation: curation({ running: true, awaitingHost: true, activeHandoffId: "hnd_rev_2", activeExecutorKind: "host_main", activeRunId: "run_rev_2" }),
+    } : {});
+    assert.equal(await C.submitSpecProposalRevise("sprop_host"), true);
+    assert.equal(copiedTexts.length, 1);
+    assert.match(copiedTexts[0], /hnd_rev_2/);
+    assert.match(toasts.at(-1), /已复制重拟维护指令/);
+    assert.equal(S.currentSpecCuration().awaitingHost, true);
+    assert.equal(S.currentSpecCuration().activeExecutorKind, "host_main");
+  } finally {
+    if (prevAgent === undefined) delete globalThis.window.sidecar.agent;
+    else globalThis.window.sidecar.agent = prevAgent;
+    if (prevClipboardDesc) Object.defineProperty(globalThis, "navigator", prevClipboardDesc);
+    else delete globalThis.navigator;
+  }
 });

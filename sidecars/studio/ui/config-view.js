@@ -6,7 +6,7 @@ import { escapeHtml, formatCatalogSourceLabel, formatTimeShort, normalizeProject
 import { isUserInteractingWithin, setText } from './dom-guards.js';
 import { CUSTOM_MODEL_PROMPT_VALUE, GLOBAL_SETTINGS_PANES, MEMBER_DRAFT_KEY, MEMBER_GROUPS, MEMBER_GROUP_IDS, MODE_PROFILE_GROUPS, MODE_PROFILE_IDS, MODE_PROFILE_LABELS, ORCHESTRATION_MODE_META, PRESET_FIELD_LABELS, PROJECT_SETTINGS_PANES, ROLE_SHORT_TITLES, SETTINGS_PANES, SETTINGS_SCOPES, SETTINGS_SCOPE_DEFAULT_PANE, SPEC_CURATION_CHANGE_LABELS, actionableSpecProposal, applySpecCurationPayload, currentOrchestrationMode, currentProjectConfig, currentProjectWorkspace, currentSpecCuration, getEffectiveConversationId, getEffectiveCwd, isCuratorBlockedProvider, isModeStageEnabled, isProjectSpecEnabled, isStatusActive, listPoolMembers, modeEnabledMembers, modeGroupProfile, modeProfileIssues, normalizeModeId, normalizeSpecArchive, orchestrationModeMeta, preferredCuratorMember, presetDisplayLabel, settingsPaneKey, settingsScopeOf, specCurationWorkspace, state } from './state.js';
 import { scheduleRender } from './render.js';
-import { armOrConfirm, copyPlainText, describeRpcError, rpcCall, showToast } from './net.js';
+import { armOrConfirm, copyPlainText, describeRpcError, relayToHostConversation, rpcCall, showToast } from './net.js';
 import { isSystemUpdateTransitionState, normalizeExtensionList, normalizeProviderId, normalizeProvidersCatalog } from './normalize.js';
 import { SPEC_KIND_LABELS, SPEC_WARNING_LABELS, engClass, formatCtx, formatModelDisplay, formatSpecBytes, roleTitle } from './widgets.js';
 import { applyCuratorLocks, commitGlobalMemberDraft, commitMemberDraft, ensurePresetsSaved, isValidCustomPresetKey, markGlobalModeProfileDirty, markGlobalPresetDirty, markModeProfileDirty, markPresetDirty, mergeRemotePresets, newCustomPresetBase, queueGlobalPresetDelete, queuePresetDelete, roleForMemberGroup, suggestCustomPresetKey, syncCurrentProjectSpecFromGlobal, syncGlobalSavePillVisibility, syncSavePillVisibility } from './presets.js';
@@ -180,7 +180,7 @@ export function editRolePreset(key, field, value, scope = 'project') {
   if (!cfg || !presetOptions(cfg, field).some(o => o.value === value && !o.disabled)) return;
   const curator = cfg.group === 'curator';
   if (curator && field === 'provider' && isCuratorBlockedProvider(value)) {
-    showToast('规范维护组不支持宿主原生引擎（后台无法脱离宿主轮次拉起原生成员），请选择外部 CLI 引擎', 'error');
+    showToast('该引擎标识不可用于规范维护组，请选择外部 CLI 或宿主原生引擎', 'error');
     return;
   }
   if (curator && (field === 'permissionMode' || field === 'isolation')) {
@@ -438,7 +438,7 @@ function memberDraftError(draft, scope = 'project') {
   if (!isValidCustomPresetKey(key)) return '成员键需以小写字母开头，仅含小写字母/数字/下划线/连字符（3~64 位），且不可使用系统保留词';
   if (ctx.presets[key] && !ctx.pendingDeletes.has(key)) return `成员键 ${key} 已存在，请换一个`;
   if (!draft.provider || !draft.model) return '请选择引擎与模型';
-  if (draft.group === 'curator' && isCuratorBlockedProvider(draft.provider)) return '规范维护组不支持宿主原生引擎，请选择外部 CLI 引擎';
+  if (draft.group === 'curator' && isCuratorBlockedProvider(draft.provider)) return '该引擎标识不可用于规范维护组，请选择外部 CLI 或宿主原生引擎';
   return '';
 }
 export function confirmAddMember(scope = 'project') {
@@ -795,7 +795,7 @@ function renderCuratorGroupHtml(group, mode, issues, scope = 'project') {
   if (scope === 'global') {
     const draftHere = draft && draft.group === group.id;
     const bodyHtml = collapsed ? '' : `${draftHere ? renderMemberDraftHtml(draft, mode, scope) : ''}
-      <div class="set-group pool-list">${members.length ? members.map((p) => renderMemberRowHtml(p, group, mode, checkedCount, scope)).join('') : '<p class="pool-curator-empty">暂无规范维护官：点击「+ 添加」选择外部 CLI 引擎（不支持宿主原生），恒为只读提案</p>'}</div>`;
+      <div class="set-group pool-list">${members.length ? members.map((p) => renderMemberRowHtml(p, group, mode, checkedCount, scope)).join('') : '<p class="pool-curator-empty">暂无规范维护官：点击「+ 添加」选择外部 CLI 或宿主原生引擎，恒为只读提案</p>'}</div>`;
     return `<section class="pool-group pool-group--curator${collapsed ? ' is-collapsed' : ''}" data-role-group="${gid}" data-pool-group="${gid}" data-mode-scope-group="${mode}" aria-label="${escapeHtml(group.title)}">
         <div class="pool-group-head">
           <button type="button" class="pool-group-toggle" data-pool-toggle="${gid}" data-fk="${ctx.fkPrefix}pool-toggle:${gid}" aria-expanded="${!collapsed}" title="${escapeHtml(group.hint)}">
@@ -812,7 +812,9 @@ function renderCuratorGroupHtml(group, mode, issues, scope = 'project') {
   const specOn = isProjectSpecEnabled();
   const draftHere = specOn && draft && draft.group === group.id;
   const pending = actionableSpecProposal(cur);
-  const runningHtml = cur.running ? '<p class="pool-curation-hint" data-curation-hint>维护官梳理中…</p>' : '';
+  const runningHtml = cur.running
+    ? `<p class="pool-curation-hint" data-curation-hint>${cur.awaitingHost ? '等待宿主执行维护票据…' : '维护官梳理中…'}</p>`
+    : '';
   const pendingHtml = pending
     ? `<button type="button" class="pool-curation-pending" data-goto-spec-proposal data-fk="curation:goto">📝 有 1 份规范维护提案待确认（${pending.changes.length} 处变更）→ 前往确认</button>`
     : '';
@@ -821,7 +823,7 @@ function renderCuratorGroupHtml(group, mode, issues, scope = 'project') {
   const offHtml = '<p class="pool-curation-off" data-curation-spec-off>本项目未开启项目规范，规范维护官已停用 <button type="button" class="set-mini-btn" data-goto-project-pane data-fk="curation:goto-project">前往「项目规范」开启</button></p>';
   const bodyHtml = collapsed ? '' : !specOn ? offHtml : `${runningHtml}${pendingHtml}
       ${draftHere ? renderMemberDraftHtml(draft, mode, scope) : ''}
-      <div class="set-group pool-list">${members.length ? members.map((p) => renderMemberRowHtml(p, group, mode, checkedCount, scope)).join('') : '<p class="pool-curator-empty">暂无规范维护官：点击「+ 添加」选择外部 CLI 引擎（不支持宿主原生），恒为只读提案</p>'}</div>`;
+      <div class="set-group pool-list">${members.length ? members.map((p) => renderMemberRowHtml(p, group, mode, checkedCount, scope)).join('') : '<p class="pool-curator-empty">暂无规范维护官：点击「+ 添加」选择外部 CLI 或宿主原生引擎，恒为只读提案</p>'}</div>`;
   return `<section class="pool-group pool-group--curator${collapsed ? ' is-collapsed' : ''}${specOn ? '' : ' is-spec-off'}" data-role-group="${gid}" data-pool-group="${gid}" data-mode-scope-group="${mode}" aria-label="${escapeHtml(group.title)}">
       <div class="pool-group-head">
         <button type="button" class="pool-group-toggle" data-pool-toggle="${gid}" data-fk="pool-toggle:${gid}" aria-expanded="${!collapsed}" title="${escapeHtml(group.hint)}">
@@ -938,13 +940,13 @@ function presetFieldsGridHtml(p, scope = 'project') {
       <div class="pool-field pool-field--row"><span class="pool-field-lbl">${PRESET_FIELD_LABELS.isolation}</span>${isolationSegHtml(p, p, scope)}</div>`;
 }
 
-/** 规范维护组可选引擎：排除宿主原生（antigravity），保留全部外部 CLI 与已启用扩展平台。 */
+/** 规范维护组可选引擎：放行宿主原生（antigravity）、全部外部 CLI 与已启用扩展平台。 */
 export function curatorProviderOptions() {
-  return state.providers.filter((x) => x && !x.isNativeHost && !isCuratorBlockedProvider(x.id)).map((x) => ({ value: x.id, label: x.name || x.id }));
+  return state.providers.filter((x) => x && !isCuratorBlockedProvider(x.id)).map((x) => ({ value: x.id, label: x.name || x.id }));
 }
 
 /**
- * 规范维护官抽屉：引擎为过滤掉宿主原生的原生 <select>（自绘下拉弹层直接读取其 options），
+ * 规范维护官抽屉：引擎为原生 <select>（支持外部 CLI 与宿主原生引擎），
  * 模型 / 思考强度自由选择；权限与隔离为跟随引擎自动锁定的只读提示（read-only / plan + 共享目录）。
  */
 function curatorFieldsGridHtml(p, scope = 'project') {
@@ -953,11 +955,14 @@ function curatorFieldsGridHtml(p, scope = 'project') {
   const provider = normalizeProviderId(p.provider);
   const opts = curatorProviderOptions();
   if (!opts.some((o) => o.value === provider)) opts.unshift({ value: provider, label: `${provider}（不可用于规范维护）` });
-  const select = `<select class="compact-select ps-curator-provider" data-curator-provider="${key}" data-fk="${ctx.fkPrefix}ps:${key}:provider" aria-label="${escapeHtml(`${p.label || p.key} · ${PRESET_FIELD_LABELS.provider}（已排除宿主原生）`)}">${opts
+  const selectId = `${ctx.idPrefix}ps-${key}-provider`;
+  const select = `<select class="compact-select ps-curator-provider" data-curator-provider="${key}" id="${selectId}" name="curator-provider" data-fk="${ctx.fkPrefix}ps:${key}:provider" aria-label="${escapeHtml(`${p.label || p.key} · ${PRESET_FIELD_LABELS.provider}`)}">${opts
     .map((o) => `<option value="${escapeHtml(o.value)}"${o.value === provider ? ' selected' : ''}>${escapeHtml(o.label)}</option>`).join('')}</select>`;
-  const perm = presetOptions(p, 'permissionMode').find((o) => o.value === p.permissionMode)?.label || p.permissionMode || '';
+  const perm = provider === 'antigravity'
+    ? '只读沙盒 / Hook 门禁 (plan)'
+    : (presetOptions(p, 'permissionMode').find((o) => o.value === p.permissionMode)?.label || p.permissionMode || '');
   return `<div class="pool-drawer-grid">
-        <div class="pool-field"><span class="pool-field-lbl">${PRESET_FIELD_LABELS.provider}</span>${select}</div>
+        <div class="pool-field"><label class="pool-field-lbl" for="${selectId}">${PRESET_FIELD_LABELS.provider}</label>${select}</div>
         <div class="pool-field"><span class="pool-field-lbl">${PRESET_FIELD_LABELS.model}</span>${presetTrigger(p, p, 'model', { scope })}</div>
         <div class="pool-field"><span class="pool-field-lbl">${PRESET_FIELD_LABELS.effort}</span>${presetTrigger(p, p, 'effort', { scope })}</div>
         <div class="pool-field"><span class="pool-field-lbl">${PRESET_FIELD_LABELS.permissionMode}</span><span class="pool-locked-field" data-curator-locked="permissionMode" title="规范维护官恒为只读提案，权限跟随引擎自动锁定">🔒 ${escapeHtml(String(perm).replace(/\s*·\s*高危$/, ''))}</span></div>
@@ -2254,7 +2259,33 @@ const SPEC_CURATION_ERRORS = {
   SPEC_ARCHIVE_CORRUPTED: '归档校验失败（manifest.json 摘要不一致），为安全起见未恢复任何文件，请检查归档目录',
   SPEC_RESTORE_CONFLICT: '恢复冲突：.agent-tower/spec/ 下已存在同名规范文件，为避免覆盖未恢复任何文件，请先处理冲突文件',
 };
-const SPEC_CURATION_SOURCES = { manual: '手动触发', auto: '自动维护', delegate: '主会话代调' };
+const SPEC_CURATION_SOURCES = { manual: '手动触发', auto: '自动维护', delegate: '主会话代调', host_main: '主会话提案' };
+
+function extractCurationHostPrompt(res) {
+  const list = Array.isArray(res?.hostActions) ? res.hostActions : [];
+  const prompts = list
+    .map((item) => (typeof item === 'string' ? item : String(item?.hostPrompt || item?.prompt || '').trim()))
+    .filter(Boolean);
+  if (prompts.length) return prompts.join('\n\n');
+  return String(res?.hostAction?.hostPrompt || res?.hostPrompt || '').trim();
+}
+
+async function relayCurationHostActions(res, kind = 'trigger') {
+  const prompt = extractCurationHostPrompt(res);
+  if (!prompt) {
+    showToast(kind === 'revise' ? '已生成宿主重拟票据，请在当前主对话执行维护指令' : '已生成宿主维护票据，请在当前主对话执行维护指令', 'info');
+    return 'failed';
+  }
+  const delivered = await relayToHostConversation(prompt);
+  if (delivered === 'sent') {
+    showToast(kind === 'revise' ? '已将修改意见发送至当前主对话重拟提案' : '已发送至当前主对话启动只读梳理，完成后提案会出现在本卡片待你确认', 'success');
+  } else if (delivered === 'copied') {
+    showToast(kind === 'revise' ? '已复制重拟维护指令，请粘贴到主对话执行' : '已复制维护指令，请粘贴到主对话执行', 'info');
+  } else {
+    showToast('未能自动发送维护指令至主对话，请手动在主对话触发规范维护', 'error');
+  }
+  return delivered;
+}
 
 export function describeSpecCurationError(err) {
   return SPEC_CURATION_ERRORS[err?.code] || describeRpcError(err);
@@ -2492,11 +2523,24 @@ export async function submitSpecCurationTrigger() {
     if (!(await ensurePresetsSaved())) return false;
     const note = ui.note.trim();
     const res = await rpcCall('specCuration', { action: 'trigger', ...specCurationParams(), conversationId: getEffectiveConversationId() || undefined, note: note || undefined });
-    absorbSpecCurationReply(res, { running: true, activeThreadId: res?.threadId || null, activeRunId: res?.runId || null });
+    const hasHostActions = Array.isArray(res?.hostActions) && res.hostActions.length > 0;
+    const awaitingHost = res?.status === 'waiting_host_dispatch' || hasHostActions;
+    absorbSpecCurationReply(res, {
+      running: true,
+      awaitingHost,
+      activeHandoffId: res?.handoffId || null,
+      activeExecutorKind: awaitingHost ? 'antigravity_subagent' : null,
+      activeThreadId: res?.threadId || null,
+      activeRunId: res?.runId || null,
+    });
     ui.note = '';
     ui.watchRun = '';
     ui.triggerOpen = false;
-    showToast(`已启动只读梳理（${curator.label || curator.key}），完成后提案会出现在本卡片待你确认`, 'success');
+    if (hasHostActions) {
+      await relayCurationHostActions(res, 'trigger');
+    } else {
+      showToast(`已启动只读梳理（${curator.label || curator.key}），完成后提案会出现在本卡片待你确认`, 'success');
+    }
     return true;
   } catch (err) {
     showToast(describeSpecCurationError(err), 'error');
@@ -2547,7 +2591,10 @@ export function toggleSpecProposalRevise(force) {
   if (ui.busy) return;
   ui.reviseOpen = typeof force === 'boolean' ? force : !ui.reviseOpen;
   if (ui.reviseOpen) state.pendingSettingsFocus = { keys: ['curation:feedback'] };
-  else releaseCurationFocus();
+  else {
+    ui.feedback = '';
+    releaseCurationFocus();
+  }
   rerenderSpecCuration();
 }
 
@@ -2568,11 +2615,26 @@ export async function submitSpecProposalRevise(proposalId) {
   rerenderSpecCuration();
   try {
     const res = await rpcCall('specCuration', { action: 'revise', proposalId, feedback, ...specCurationParams() });
-    absorbSpecCurationReply(res, { pendingProposal: null, recentProposals: [], running: true, activeThreadId: res?.threadId || proposal.threadId || null, activeRunId: res?.runId || null });
+    const hasHostActions = Array.isArray(res?.hostActions) && res.hostActions.length > 0;
+    const awaitingHost = res?.status === 'waiting_host_dispatch' || hasHostActions;
+    absorbSpecCurationReply(res, {
+      pendingProposal: null,
+      recentProposals: [],
+      running: true,
+      awaitingHost,
+      activeHandoffId: res?.handoffId || null,
+      activeExecutorKind: awaitingHost ? (res?.activeExecutorKind || 'antigravity_subagent') : null,
+      activeThreadId: res?.threadId || (awaitingHost ? null : proposal.threadId || null),
+      activeRunId: res?.runId || null,
+    });
     ui.feedback = '';
     ui.watchRun = '';
     ui.reviseOpen = false;
-    showToast('已打回修改意见，原维护官正在按意见重拟提案', 'success');
+    if (hasHostActions) {
+      await relayCurationHostActions(res, 'revise');
+    } else {
+      showToast('已打回修改意见，原维护官正在按意见重拟提案', 'success');
+    }
     return true;
   } catch (err) {
     showToast(describeSpecCurationError(err), 'error');
@@ -2598,6 +2660,42 @@ export async function dismissSpecProposal(proposalId) {
     const res = await rpcCall('specCuration', { action: 'dismiss', proposalId, ...specCurationParams() });
     absorbSpecCurationReply(res, { pendingProposal: null, recentProposals: [] });
     showToast('已放弃本次规范维护提案（未写入任何文件）', 'success');
+    return true;
+  } catch (err) {
+    showToast(describeSpecCurationError(err), 'error');
+    return false;
+  } finally {
+    ui.busy = '';
+    rerenderSpecCuration();
+  }
+}
+
+/** 取消未认领的宿主原生维护票据（或未提交的主会话维护锁），释放等待态。 */
+export async function cancelSpecCurationTicket() {
+  const ui = state.specCurationUi;
+  const cur = currentSpecCuration();
+  if (ui.busy || !(cur.awaitingHost || cur.running && cur.activeExecutorKind === 'host_main')) return false;
+  if (specCurationUnbound()) {
+    showToast('当前未绑定项目目录，无法取消维护等待', 'info');
+    return false;
+  }
+  ui.busy = 'cancel-ticket';
+  rerenderSpecCuration();
+  try {
+    const res = await rpcCall('specCuration', { action: 'cancelTicket', ...specCurationParams(), runId: cur.activeRunId || undefined });
+    if (res?.cancelled === false) {
+      absorbSpecCurationReply(res);
+      showToast('维护状态已变化，请查看当前进度', 'info');
+      return false;
+    }
+    absorbSpecCurationReply(res, {
+      running: false,
+      awaitingHost: false,
+      activeHandoffId: null,
+      activeExecutorKind: null,
+      activeRunId: null,
+    });
+    showToast('已取消宿主规范维护等待', 'success');
     return true;
   } catch (err) {
     showToast(describeSpecCurationError(err), 'error');
@@ -2691,11 +2789,11 @@ function renderSpecProposalCardHtml(p) {
     ? '整组原子写入并刷新 INDEX.md（写入前校验文件未被外部改动）'
     : !specOn ? '本项目未开启项目规范，不能确认落盘（可放弃本提案）' : isConflict ? '文件已被外部修改，不能确认落盘' : '预检未通过，不能确认落盘';
   const armed = (state.pendingConfirms.get(`spec-proposal-dismiss:${p.id}`) || 0) > Date.now();
-  const revise = ui.reviseOpen && specOn
+  const feedbackInputId = `inp-curation-feedback-${id}`;
+  const revise = specOn
     ? `<div class="ps-curation-inline" data-curation-revise-bar>
-        <input type="text" class="text-input ps-curation-input" data-curation-input="feedback" data-fk="curation:feedback" data-at-draft value="${escapeHtml(ui.feedback)}" maxlength="500" autocomplete="off" placeholder="修改意见：例如「两条合并成一篇」「删掉第二条」「措辞再短些」" aria-label="打回修改意见" />
-        <button type="button" class="ghost-xs-btn is-accent" data-curation-revise-submit="${id}" data-fk="curation:revise-submit"${busy ? ' disabled' : ''}>${ui.busy === 'revise' ? '提交中…' : '提交意见并重拟'}</button>
-        <button type="button" class="ghost-xs-btn" data-curation-revise-cancel data-fk="curation:revise-cancel"${busy ? ' disabled' : ''}>取消</button>
+        <label class="pool-field-lbl" for="${feedbackInputId}">修改建议</label>
+        <input type="text" class="text-input ps-curation-input" data-curation-input="feedback" id="${feedbackInputId}" name="curation-feedback" data-fk="curation:feedback" data-at-draft value="${escapeHtml(ui.feedback)}" maxlength="500" autocomplete="off" placeholder="可选：哪里不满意或怎么改（如：删掉第 2 条、措辞再短些）" aria-label="打回修改意见"${busy ? ' disabled' : ''} />
       </div>`
     : '';
   return `<div class="ps-curation-card" data-spec-proposal="${id}" role="region" aria-label="规范维护提案待确认">
@@ -2707,12 +2805,12 @@ function renderSpecProposalCardHtml(p) {
       ${p.summary ? `<p class="ps-curation-summary">${escapeHtml(p.summary)}</p>` : ''}
       ${issues.length ? `<ul class="spec-warn-list ps-curation-issues" role="alert">${issues.map((x) => `<li>${escapeHtml(x)}</li>`).join('')}</ul>` : ''}
       ${p.changes.length ? `<ol class="ps-curation-changes">${p.changes.map(renderCurationChangeHtml).join('')}</ol>` : ''}
+      ${revise}
       <div class="ps-curation-actions">
         <button type="button" class="ghost-xs-btn is-accent" data-curation-confirm="${id}" data-fk="curation:confirm"${canConfirm && !busy ? '' : ' disabled'} title="${escapeHtml(confirmTitle)}">${ui.busy === 'confirm' ? '写入中…' : '确认更新规范'}</button>
-        <button type="button" class="ghost-xs-btn" data-curation-revise-open="${id}" data-fk="curation:revise" aria-expanded="${ui.reviseOpen && specOn}"${busy || !specOn ? ' disabled' : ''}>打回修改</button>
+        <button type="button" class="ghost-xs-btn" data-curation-revise-submit="${id}" data-fk="curation:revise-submit"${busy || !specOn ? ' disabled' : ''} title="${specOn ? '按上方填写的修改建议打回给维护官重新拟定' : '本项目未开启项目规范，不能打回重拟'}">${ui.busy === 'revise' ? '提交中…' : '按意见打回重拟'}</button>
         <button type="button" class="ghost-xs-btn${armed ? ' is-armed danger-txt' : ''}" data-curation-dismiss="${id}" data-fk="curation:dismiss"${busy ? ' disabled' : ''}>${ui.busy === 'dismiss' ? '放弃中…' : armed ? '确认放弃？' : '放弃'}</button>
       </div>
-      ${revise}
     </div>`;
 }
 
@@ -2722,7 +2820,8 @@ export function renderSpecCurationSection() {
   const cur = currentSpecCuration();
   const activeProposal = actionableSpecProposal(cur);
   const unbound = specCurationUnbound();
-  const running = cur.running || ui.busy === 'trigger';
+  const awaitingHost = cur.awaitingHost === true;
+  const running = cur.running || awaitingHost || ui.busy === 'trigger';
   const autoBtn = document.getElementById('btn-spec-curation-auto');
   if (autoBtn) {
     autoBtn.setAttribute('aria-checked', String(cur.autoTrigger));
@@ -2736,7 +2835,7 @@ export function renderSpecCurationSection() {
     trigBtn.disabled = unbound || running || !cur.specEnabled;
     trigBtn.setAttribute('aria-busy', String(running));
     trigBtn.setAttribute('aria-expanded', String(ui.triggerOpen && !running));
-    const label = running ? '梳理中…' : '✨ 维护规范';
+    const label = awaitingHost ? '等待宿主…' : running ? '梳理中…' : '✨ 维护规范';
     if (trigBtn.textContent !== label) trigBtn.textContent = label;
   }
   syncSpecLimitInputs(cur, unbound, false);
@@ -2747,12 +2846,17 @@ export function renderSpecCurationSection() {
   const specOn = isProjectSpecEnabled();
   if (ui.triggerOpen && !running && !unbound && specOn) {
     parts.push(`<div class="ps-curation-inline" data-curation-trigger-bar>
-        <input type="text" class="text-input ps-curation-input" data-curation-input="note" data-fk="curation:note" data-at-draft value="${escapeHtml(ui.note)}" maxlength="300" autocomplete="off" placeholder="可选：补充本次想沉淀或删改的规范方向" aria-label="规范维护补充说明（可选）" />
+        <input type="text" class="text-input ps-curation-input" data-curation-input="note" name="curation-note" data-fk="curation:note" data-at-draft value="${escapeHtml(ui.note)}" maxlength="300" autocomplete="off" placeholder="可选：补充本次想沉淀或删改的规范方向" aria-label="规范维护补充说明（可选）" />
         <button type="button" class="ghost-xs-btn is-accent" data-curation-trigger-submit data-fk="curation:trigger-submit"${ui.busy ? ' disabled' : ''}>启动只读梳理</button>
         <button type="button" class="ghost-xs-btn" data-curation-trigger-cancel data-fk="curation:trigger-cancel">取消</button>
       </div>`);
   }
-  if (running && specOn) {
+  if (specOn && (awaitingHost || cur.running && cur.activeExecutorKind === 'host_main')) {
+    parts.push(`<div class="ps-curation-status ps-curation-status--row" role="status" ${awaitingHost ? 'data-curation-awaiting-host' : 'data-curation-running'}>
+        <span>${awaitingHost ? '⏳ 等待宿主执行维护票据…' : '主会话正在梳理规范，等待提交提案…'}</span>
+        <button type="button" class="ghost-xs-btn" data-curation-cancel-ticket data-fk="curation:cancel-ticket"${ui.busy === 'cancel-ticket' ? ' disabled' : ''}>${ui.busy === 'cancel-ticket' ? '取消中…' : awaitingHost ? '取消等待' : '取消梳理'}</button>
+      </div>`);
+  } else if (running && specOn) {
     parts.push('<p class="ps-curation-status" role="status" data-curation-running>⏳ 规范维护官只读梳理中…完成后提案会出现在这里，确认前不会改动任何规范文件</p>');
   } else if (!activeProposal && cur.lastNoChange && specOn) {
     parts.push(`<p class="ps-curation-status is-muted" role="status" data-curation-nochange>上次梳理结论：无需改动${cur.lastNoChange.reason ? ` · ${escapeHtml(cur.lastNoChange.reason)}` : ''}</p>`);

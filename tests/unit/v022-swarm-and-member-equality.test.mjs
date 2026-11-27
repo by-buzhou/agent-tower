@@ -260,7 +260,12 @@ test("probe-based seeds include only available core binaries, bridged AGY and in
     customProviders: [{ id: "opencode", command: "opencode", enabled: true }, { id: "disabled", command: "disabled", enabled: false }],
     catalog: { providers: [{ id: "opencode", isExtension: true, installed: true, models: [{ slug: "custom/model" }] }] },
   });
-  assert.equal(Object.keys(many.presets).length, 15);
+  assert.equal(Object.keys(many.presets).length, 16);
+  assert.equal(many.modeProfiles.complex.curator.preferredKey, "curator_codex");
+  assert.equal(many.presets.curator_agy.permissionMode, "plan");
+  assert.equal(buildInitialRosterFromProbe({ hostBridgeAvailable: true }).modeProfiles.complex.curator.preferredKey, "curator_agy");
+  assert.equal(buildInitialRosterFromProbe({ hostBridgeAvailable: true, binaries: { "kimi-code": binary } })
+    .modeProfiles.complex.curator.preferredKey, "curator_kimi");
   assert.equal(many.presets.executor_agy.provider, "antigravity");
   assert.equal(many.presets.executor_opencode.model, "custom/model");
   assert.deepEqual(new Set(many.modeProfiles.complex.reviewer.enabledKeys), new Set(["reviewer_codex", "reviewer_claude", "reviewer_agy", "reviewer_opencode"]));

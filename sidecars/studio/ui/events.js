@@ -13,7 +13,7 @@ import { cancelCustomModelModal, confirmCustomModelModal, handleModelSelectChang
 import { UNBOUND_CONVERSATION_HINT, closeMemberDrawer, hydrateOrderRunItems, isConversationDispatchEnabled, loadBootstrap, resetForConversation } from './stream.js';
 import { applySystemUpdate, cancelSystemUpdate, checkSystemUpdates, dismissSystemUpdate, handleTwoStageCancel, respondToRequest, rollbackSystemUpdate, setProjectExternalSessionMode, toggleAutoCheckUpdates, toggleDefaultExternalSessionVisible } from './actions.js';
 import { handleCleanupWorktree, handleIntegrateWorktree, loadSelectedWorktreeDiff, refreshWorktreesList, selectWorktree } from './worktree-view.js';
-import { applyCatalogFilter, applyExtLibState, cancelAddGlobalMember, cancelAddMember, confirmAddGlobalMember, confirmAddMember, confirmSpecProposal, copyText, deleteCustomMember, deleteGlobalCustomMember, dismissSpecProposal, editGlobalRolePreset, editRolePreset, editingGlobalModeProfile, editingModeProfile, gotoProjectSpecsSection, gotoRolePreset, handleArchiveProjectSpecs, handleCleanRuntimeCache, handleInitProjectSpecs, handleResetRosterToGlobal, handleRestoreProjectSpecs, handleSyncPluginSpecTemplates, handleSyncRosterToGlobal, openProjectSpecInEditor, quickEnableTemplateProvider, refreshExtensionProviders, refreshRuntimeCacheStatus, reloadProjectSpecs, removeOrDisableExtension, revealSpecCurationPanel, saveSpecCurationLimits, setEditingModeProfile, setGlobalEditingModeProfile, setGlobalMemberDraftGroup, setGlobalMemberLabel, setGlobalModePreferred, setMemberDraftGroup, setMemberLabel, setModePreferred, setSettingsPane, setSpecCurationDetailOpen, startAddGlobalMember, startAddMember, submitSpecCurationTrigger, submitSpecProposalRevise, toggleCatalogProvider, toggleDefaultSpecEnabled, toggleGlobalMemberDrawer, toggleGlobalModeMember, toggleGlobalModeStage, toggleGlobalPoolGroup, toggleMemberDrawer, toggleModeMember, toggleModeStage, togglePoolGroup, toggleProjectSpec, toggleProjectSpecEnabled, toggleSpecCurationAuto, toggleSpecCurationTriggerBar, toggleSpecProposalRevise, updateGlobalMemberDraftField, updateMemberDraftField, updateSpecCurationDraft } from './config-view.js';
+import { applyCatalogFilter, applyExtLibState, cancelAddGlobalMember, cancelAddMember, cancelSpecCurationTicket, confirmAddGlobalMember, confirmAddMember, confirmSpecProposal, copyText, deleteCustomMember, deleteGlobalCustomMember, dismissSpecProposal, editGlobalRolePreset, editRolePreset, editingGlobalModeProfile, editingModeProfile, gotoProjectSpecsSection, gotoRolePreset, handleArchiveProjectSpecs, handleCleanRuntimeCache, handleInitProjectSpecs, handleResetRosterToGlobal, handleRestoreProjectSpecs, handleSyncPluginSpecTemplates, handleSyncRosterToGlobal, openProjectSpecInEditor, quickEnableTemplateProvider, refreshExtensionProviders, refreshRuntimeCacheStatus, reloadProjectSpecs, removeOrDisableExtension, revealSpecCurationPanel, saveSpecCurationLimits, setEditingModeProfile, setGlobalEditingModeProfile, setGlobalMemberDraftGroup, setGlobalMemberLabel, setGlobalModePreferred, setMemberDraftGroup, setMemberLabel, setModePreferred, setSettingsPane, setSpecCurationDetailOpen, startAddGlobalMember, startAddMember, submitSpecCurationTrigger, submitSpecProposalRevise, toggleCatalogProvider, toggleDefaultSpecEnabled, toggleGlobalMemberDrawer, toggleGlobalModeMember, toggleGlobalModeStage, toggleGlobalPoolGroup, toggleMemberDrawer, toggleModeMember, toggleModeStage, togglePoolGroup, toggleProjectSpec, toggleProjectSpecEnabled, toggleSpecCurationAuto, toggleSpecCurationTriggerBar, toggleSpecProposalRevise, updateGlobalMemberDraftField, updateMemberDraftField, updateSpecCurationDraft } from './config-view.js';
 import { openFileInHostOrInspector, setActiveView } from './nav.js';
 import { handleArchiveIdleMembers, handleDeleteThread, jumpToNativeHostConversation, openMemberDrawer } from './members-view.js';
 import { renderBoardView, revealBoardSeq } from './board-view.js';
@@ -654,7 +654,7 @@ export function bindGlobalEvents() {
     grid?.addEventListener('change', (e) => {
       const key = e.target.dataset?.memberLabel;
       if (key) setLabel(key, e.target.value);
-      // 规范维护官引擎：原生 <select>（已排除宿主原生），选中后走与自绘下拉相同的 edit 校验链
+      // 规范维护官引擎：原生 <select>（支持外部 CLI 与宿主原生），选中后走与自绘下拉相同的 edit 校验链
       const curatorKey = e.target.dataset?.curatorProvider;
       if (curatorKey) edit(curatorKey, 'provider', e.target.value);
     });
@@ -798,9 +798,10 @@ export function bindGlobalEvents() {
     let el;
     if (hit('[data-curation-trigger-submit]')) void submitSpecCurationTrigger();
     else if (hit('[data-curation-trigger-cancel]')) toggleSpecCurationTriggerBar(false);
+    else if (hit('[data-curation-cancel-ticket]')) void cancelSpecCurationTicket();
     else if ((el = hit('[data-curation-confirm]'))) { if (!el.disabled) void confirmSpecProposal(el.dataset.curationConfirm); }
     else if ((el = hit('[data-curation-revise-open]'))) toggleSpecProposalRevise();
-    else if ((el = hit('[data-curation-revise-submit]'))) void submitSpecProposalRevise(el.dataset.curationReviseSubmit);
+    else if ((el = hit('[data-curation-revise-submit]'))) { if (!el.disabled) void submitSpecProposalRevise(el.dataset.curationReviseSubmit); }
     else if (hit('[data-curation-revise-cancel]')) toggleSpecProposalRevise(false);
     else if ((el = hit('[data-curation-dismiss]'))) void dismissSpecProposal(el.dataset.curationDismiss);
   });

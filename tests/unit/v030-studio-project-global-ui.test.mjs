@@ -531,7 +531,8 @@ test("可插拔 Spec 关停：总开关 setEnabled、项目规范卡片折叠、
   C.renderSpecCurationSection();
   const panel = els.get("spec-curation-panel").innerHTML;
   assert.match(panel, /data-curation-confirm="sprop_2" data-fk="curation:confirm" disabled/);
-  assert.match(panel, /data-curation-revise-open="sprop_2"[^>]* disabled/);
+  assert.match(panel, /data-curation-revise-submit="sprop_2"[^>]* disabled/);
+  assert.doesNotMatch(panel, /data-curation-revise-bar/);
   assert.doesNotMatch(panel, /data-curation-dismiss="sprop_2"[^>]* disabled/);
 
   // 重新开启：setEnabled true

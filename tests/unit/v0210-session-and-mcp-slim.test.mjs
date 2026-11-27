@@ -283,7 +283,9 @@ test("v0.2.10 MCP Schema 去重纠偏与出口瘦身", () => {
   assert.equal(reviewProps.mode.default, "async");
   assert.equal(reviewProps.timeoutMs.type, "number");
   assert.ok(batch.readPaths && batch.includeReport);
-  assert.equal(MCP_TOOLS.length, 16);
+  assert.equal(MCP_TOOLS.length, 17);
+  assert.deepEqual(tool("spec_curation").inputSchema.required, ["action", "cwd"]);
+  assert.deepEqual(tool("spec_curation").inputSchema.properties.action.enum, ["begin", "submit"]);
 
   const items = batch.tasks.items.properties;
   assert.deepEqual(Object.keys(items).sort(), Object.keys(delegate).sort());

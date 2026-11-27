@@ -1561,7 +1561,6 @@ function presetGroup(value, fallback = "advisor") { return ["advisor", "executor
 
 export function curatorRestrictions(provider) {
   provider = normalizeProviderId(provider);
-  if (provider === "antigravity") throw presetError("规范维护官仅支持外部引擎", "CURATOR_PROVIDER_UNSUPPORTED");
   return { permissionMode: provider === "codex" ? "read-only" : "plan", interactionMode: "plan", isolation: "shared" };
 }
 
@@ -1731,7 +1730,7 @@ export function buildInitialRosterFromProbe({ binaries = {}, catalog, hostBridge
   }
   for (const [group, prefix] of [["advisor", "军师"], ["executor", "执行官"], ["reviewer", "终审官"], ["curator", "规范维护官"]]) {
     for (const [provider, suffix] of [["claude-code", "claude"], ["codex", "codex"], ["kimi-code", "kimi"], ["antigravity", "agy"]]) {
-      if (group === "curator" && provider === "antigravity") continue;
+      if (group === "curator" && provider === "antigravity" && !hostBridgeAvailable) continue;
       if (!(binaryAvailable(binaries[provider]) || (provider === "antigravity" && (hostBridgeAvailable || binaryAvailable(binaries.agy))))) continue;
       const entry = providers.find(p => p.id === provider);
       const key = `${group}_${suffix}`;
@@ -1756,7 +1755,11 @@ export function buildInitialRosterFromProbe({ binaries = {}, catalog, hostBridge
     }
   }
   const activePresets = mergeActivePresets(presets, [], { rosterVersion: 2 });
-  return { presets: activePresets, modeProfiles: normalizeModeProfiles(undefined, activePresets) };
+  const modeProfiles = normalizeModeProfiles(undefined, activePresets);
+  const curator = modeProfiles.complex.curator;
+  curator.preferredKey = curator.enabledKeys.includes("curator_codex") ? "curator_codex" :
+    curator.enabledKeys.find(key => activePresets[key].provider !== "antigravity") || curator.enabledKeys[0] || null;
+  return { presets: activePresets, modeProfiles };
 }
 export function normalizeMemberPool(rawPool = {}, activePresets = DEFAULT_ROLE_PRESETS) {
   const result = structuredClone(DEFAULT_MEMBER_POOL);

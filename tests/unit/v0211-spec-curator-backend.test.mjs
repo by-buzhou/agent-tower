@@ -79,7 +79,8 @@ specTest("维护官角色卡独家注入，首装预填外部引擎，窄 argv �
   assert.equal(modeProfiles.complex.curator.preferredKey, "curator_codex");
   assert.equal(presets.curator_codex.permissionMode, "read-only");
   assert.equal(presets.curator_claude.permissionMode, "plan");
-  assert.equal(mergeActivePresets({ curator: { group: "curator", provider: "antigravity" } }).curator, undefined);
+  const native = mergeActivePresets({ curator_agy: { group: "curator", provider: "antigravity" } }).curator_agy;
+  assert.deepEqual([native.permissionMode, native.interactionMode, native.isolation], ["plan", "plan", "shared"]);
 }));
 
 specTest("状态和开关按项目隔离，Studio 可在 direct 启动且 no_change 无确认卡", () => withProjectSandbox("c-zero", async dir => {
@@ -126,10 +127,6 @@ specTest("外部引擎及排队、配置和重试的锁定，越权写盘作废"
     await o.saveSettings({ defaultOrchestrationMode: "relay", presets: {
       curator_claude: { group: "curator", provider: "claude-code", model: "claude-opus-5-5", permissionMode: "bypassPermissions" },
     }, modeProfiles: { complex: { curator: { enabledKeys: ["curator_codex", "curator_claude"] } } } });
-    await assert.rejects(o.saveSettings({ presets: { curator_agy: { group: "curator", provider: "antigravity" } } }),
-      { code: "CURATOR_PROVIDER_UNSUPPORTED" });
-    await assert.rejects(o.delegateTask({ cwd: root, role: "curator", provider: "antigravity", task: "deny" }),
-      { code: "CURATOR_PROVIDER_UNSUPPORTED" });
     const first = await o.delegateTask({ cwd: root, role: "curator", provider: "claude-code",
       permissionMode: "bypassPermissions", interactionMode: "default", isolation: "worktree", task: "inspect" });
     const key = { threadId: first.threadId };
@@ -418,7 +415,7 @@ specTest("原生 Swarm 协调者会话收口后不会死锁复杂模式自动维
       });
     });
     await o.getBootstrap(params);
-    await Promise.race([auto, delay(1100)]);
+    await within(auto, 5000, "settled swarm auto-curation");
     assert.equal(calls.length, 1);
     assert.match(calls[0].prompt, /SPEC CURATOR/);
   } finally { await o.shutdown(); }
@@ -529,6 +526,206 @@ specTest("按项目独立设置单篇与总上限（setLimits）：空白仓零�
     });
     assert.ok(bundle.full.meta.specBytes <= 18_500 && bundle.full.meta.inlineCount >= 3 && bundle.full.meta.summaryCount >= 2,
       `存量扩容后单次注入仍受 16KiB 护栏约束: inline=${bundle.full.meta.inlineCount}, summary=${bundle.full.meta.summaryCount}, bytes=${bundle.full.meta.specBytes}`);
+  } finally { await o.shutdown(); }
+}));
+
+specTest("主会话在三种模式只提交提案，按会话隔离并在打回后重新取准则", () => withProjectSandbox("c-host-main", async dir => {
+  const cwd = plainProject(dir, "r");
+  const o = open(dir, cwd);
+  const args = { cwd, conversationId: "main", sessionId: "main-session" };
+  const curate = (action, params = {}) => o.specCuration({ ...args, ...params, action });
+  try {
+    await o.saveSettings({ modeProfiles: { complex: { curator: { enabledKeys: [] } } } });
+    await assert.rejects(curate("submit", { status: "no_change", reason: "none" }), { code: "CURATOR_SESSION_NOT_FOUND" });
+    for (const orchestrationMode of ["direct", "relay", "complex"]) {
+      await o.setConversationPolicy({ ...args, orchestrationMode });
+      const initial = await curate("begin");
+      assert.match(initial.prompt, /ROLE: SPEC CURATOR/);
+      assert.equal(initial.curation.activeExecutorKind, "host_main");
+      assert.equal((await curate("begin")).runId, initial.runId);
+      await assert.rejects(curate("submit", { sessionId: "other", rawText: none }), { code: "CURATOR_SESSION_NOT_FOUND" });
+      await assert.rejects(curate("submit", { status: "propose", changes: [] }), { code: "CURATOR_INVALID_PROPOSAL" });
+      assert.equal((await curate("submit", { status: "no_change", reason: "none" })).status, "no_change");
+    }
+    await curate("begin");
+    const pending = await curate("submit", { status: "propose", summary: "prior",
+      changes: [document("create", business, markdown("rule", "new"))] });
+    assert.equal(pending.proposal.executorKind, "host_main");
+    assert.equal(pending.status, "pending");
+    assert.equal(fs.existsSync(path.join(cwd, business)), false);
+    const revise = await curate("revise", { proposalId: pending.proposal.id, feedback: "clarify" });
+    assert.equal(revise.status, "waiting_host_dispatch");
+    assert.equal(revise.curation.awaitingHost, true);
+    assert.match(revise.hostAction.hostPrompt, /AgentTower Curation Ticket.*spec_curation/);
+    const revisionBegin = JSON.parse(/spec_curation\((\{.*?\})\)/.exec(revise.hostAction.hostPrompt)[1]);
+    assert.match((await o.specCuration(revisionBegin)).prompt, /prior[\s\S]*clarify/);
+    write(cwd, business, markdown("rule", "changed elsewhere"));
+    await assert.rejects(curate("submit", { sessionId: revisionBegin.sessionId, rawText: none }), { code: "CURATOR_SPEC_WRITE_DETECTED" });
+    assert.equal((await curate("status")).curation.running, false);
+    await curate("begin");
+    assert.equal((await curate("cancelTicket")).cancelled, true);
+    const next = await curate("begin");
+    assert.equal((await curate("cancelTicket", { runId: pending.runId })).cancelled, false);
+    assert.equal((await curate("status")).curation.activeRunId, next.runId);
+    await curate("cancelTicket");
+    await curate("begin");
+    const replacement = await curate("submit", { rawText: draft(document("update", business, markdown("rule", "new"))) });
+    const ticket = await curate("revise", { proposalId: replacement.proposal.id, feedback: "redo" });
+    const beginArgs = JSON.parse(/spec_curation\((\{.*?\})\)/.exec(ticket.hostAction.hostPrompt)[1]);
+    await curate("cancelTicket", { runId: ticket.runId });
+    await assert.rejects(o.specCuration(beginArgs), { code: "CURATOR_SESSION_NOT_FOUND" });
+    await curate("setEnabled", { enabled: false });
+    await assert.rejects(curate("begin"), { code: "SPEC_DISABLED_FOR_PROJECT" });
+  } finally { await o.shutdown(); }
+}));
+
+specTest("原生 research 票据单次放行，注入用户上下文并通过实时转录幂等结算", () => withProjectSandbox("c-native-research", async dir => {
+  const cwd = plainProject(dir, "r"), appDataDir = plainProject(dir, "h");
+  const o = open(dir, cwd);
+  const conversationId = "de100000-1111-4111-8111-111111111111";
+  const child = "de200000-1111-4111-8111-111111111111";
+  const args = { cwd, workspace: cwd, conversationId, appDataDir };
+  const transcript = id => `brain/${id}/.system_generated/logs/transcript.jsonl`;
+  const step = (type, step_index, content) => JSON.stringify({
+    type, step_index, content, status: "DONE", created_at: new Date().toISOString(),
+  }) + "\n";
+  write(appDataDir, transcript(conversationId), step("USER_INPUT", 1, "真实规范原话") +
+    step("USER_INPUT", 2, "[AgentTower Curation Ticket] 控制消息甲") +
+    step("USER_INPUT", 3, "[AgentTower Auto-Curation] 控制消息乙") +
+    step("USER_INPUT", 4, "请执行宿主原生派遣票据 #hnd_fixture 控制消息丙"));
+  o.updateHostContext({ appDataDir });
+  const curate = (action, extra = {}) => o.specCuration({ ...args, action, ...extra });
+  try {
+    await o.saveSettings({ presets: { curator_agy: { group: "curator", provider: "antigravity", model: "flash" } },
+      modeProfiles: { complex: { curator: { enabledKeys: ["curator_agy"] } } } });
+    await o.getBootstrap(args);
+    const expired = await curate("trigger", { ticketTtlMs: 35 });
+    assert.equal(expired.curation.awaitingHost, true);
+    await delay(60);
+    assert.equal((await curate("status")).curation.running, false);
+    const started = await curate("trigger");
+    assert.equal(started.hostAction.tool, "invoke_subagent");
+    assert.equal(started.hostAction.args.TypeName, "research");
+    assert.match(started.runId, /^run_cur_/);
+    assert.notEqual(started.runId, expired.runId);
+    const gate = { ...args, hostToolName: started.hostAction.tool, hostToolArgs: started.hostAction.args };
+    assert.equal(o.getConversationPolicy({ ...gate, hostToolArgs: { ...gate.hostToolArgs, TypeName: "self" } }).hostToolAllowed, false);
+    assert.equal(o.getConversationPolicy(gate).curationTicketAllowed, true);
+    assert.equal(o.getConversationPolicy(gate).hostToolAllowed, false);
+    const unrelated = "de250000-1111-4111-8111-111111111111";
+    o.db.upsertThread({ id: "thr_native_" + unrelated, hostConversationId: unrelated, workspace: cwd,
+      meta: { isNativeHost: true, rootConversationId: conversationId } });
+    const otherPlaybook = o.getConversationPolicy({ ...args, conversationId: unrelated, syncHostPlaybook: true });
+    assert.doesNotMatch(otherPlaybook.playbookInject || "", /ROLE: SPEC CURATOR/);
+    assert.equal((await curate("status")).curation.awaitingHost, true);
+    write(appDataDir, transcript(child), "");
+    fs.appendFileSync(path.join(appDataDir, transcript(conversationId)), JSON.stringify({
+      type: "PLANNER_RESPONSE", step_index: 5, status: "DONE", created_at: new Date().toISOString(),
+      tool_calls: [{ name: "invoke_subagent", args: started.hostAction.args }],
+    }) + "\n" + step("GENERIC", 6, `invoke_subagent spawned ${child}`));
+    await o.getBootstrap(args);
+    const playbook = (await o.getConversationPolicy({ ...args, conversationId: child,
+      syncHostPlaybook: true, deferPlaybookCommit: true })).playbookInject;
+    assert.match(playbook, /SPEC CURATOR[\s\S]*真实规范原话/);
+    assert.doesNotMatch(playbook, /控制消息[甲乙丙]/);
+    const guardPath = path.join(dir, "control", "active-native-curators.json");
+    assert.deepEqual(JSON.parse(fs.readFileSync(guardPath, "utf8")).conversationIds, [child]);
+    assert.equal((await curate("status")).curation.awaitingHost, false);
+    assert.equal((await curate("cancelTicket")).cancelled, false);
+    fs.appendFileSync(path.join(appDataDir, transcript(child)), step("USER_INPUT", 1, "执行票据") +
+      step("PLANNER_RESPONSE", 2, draft(document("create", business, markdown("rule", "native")))));
+    await o.getBootstrap(args);
+    const state = (await curate("status")).curation;
+    assert.equal(state.running, false);
+    assert.equal(state.pendingProposal.executorKind, "antigravity_subagent");
+    assert.equal(state.pendingProposal.runId, started.runId);
+    assert.equal(fs.existsSync(guardPath), false);
+    assert.equal(fs.existsSync(path.join(cwd, business)), false);
+    await o.getBootstrap(args);
+    assert.equal((await curate("status")).curation.pendingProposal.id, state.pendingProposal.id);
+    const revision = await curate("revise", { proposalId: state.pendingProposal.id, feedback: "again" });
+    assert.match(revision.hostAction.args.Prompt, /上版提案摘要[\s\S]*上版问题[\s\S]*again/);
+    assert.equal((await curate("cancelTicket")).cancelled, true);
+  } finally { await o.shutdown(); }
+}));
+
+specTest("锁模维护官从 Swarm 黑板结算，驻留成员再派只认新一轮回复", () => withProjectSandbox("c-native-swarm", async dir => {
+  const cwd = plainProject(dir, "r"), appDataDir = plainProject(dir, "h");
+  const wakes = [];
+  const o = createOrchestrator({ dataDir: path.join(dir, "control"), defaultStudioRoot: cwd, catalogLoader: offlineCatalog,
+    hostWakeSender: async message => { wakes.push(message); return { ok: true }; } });
+  o.db.saveSettings({ defaultSpecEnabled: true });
+  o.updateHostContext({ appDataDir });
+  const conversationId = "de300000-1111-4111-8111-111111111111";
+  const child = "de400000-1111-4111-8111-111111111111";
+  const args = { cwd, workspace: cwd, conversationId, appDataDir };
+  const systemDir = `brain/${conversationId}/.system_generated`;
+  const putRoster = (name, wake_mode) => write(appDataDir, `${systemDir}/swarm/members.json`, JSON.stringify({ members: {
+    coordinator: { role: "coordinator", conversation_id: conversationId },
+    [name]: { role: "worker", conversation_id: child, wake_mode, applied_model: "gemini-4-argon" },
+  } }));
+  const board = (seq, name, status) => JSON.stringify({ seq, agent: name, time: new Date().toISOString(), text: "@coordinator [done] " + status }) + "\n";
+  const curate = (action, extra = {}) => o.specCuration({ ...args, action, ...extra });
+  write(appDataDir, `${systemDir}/logs/transcript.jsonl`, [
+    { type: "USER_INPUT", step_index: 1, content: "work" },
+    { type: "PLANNER_RESPONSE", step_index: 2, status: "DONE", content: "completed" },
+  ].map(step => JSON.stringify({ ...step, created_at: new Date().toISOString() })).join("\n") + "\n");
+  try {
+    await o.saveSettings({ presets: { curator_agy: { group: "curator", provider: "antigravity", model: "gemini-4-argon" } },
+      modeProfiles: { complex: { curator: { enabledKeys: ["curator_agy"] } } } });
+    await o.getBootstrap(args);
+    const started = await curate("trigger", { _standalone: true });
+    assert.equal(started.hostAction.tool, "swarm");
+    assert.match(started.hostAction.args.brief, /严禁改写[\s\S]*agent-tower-spec-proposal[\s\S]*swarm_wait/);
+    assert.equal(wakes.at(-1)?.message, started.hostAction.hostPrompt);
+    const gate = { ...args, hostToolName: "swarm", hostToolArgs: started.hostAction.args };
+    assert.equal(o.getConversationPolicy(gate).curationTicketAllowed, true);
+    const name = started.hostAction.args.name;
+    putRoster(name, "manual");
+    await o.getBootstrap(args);
+    assert.equal((await curate("status")).curation.awaitingHost, false);
+    putRoster(name, "mentions");
+    const boardPath = `${systemDir}/swarm/board.jsonl`;
+    const first = board(1, name, draft(document("create", business, markdown("rule", "swarm"))));
+    write(appDataDir, boardPath, first);
+    await o.getBootstrap(args);
+    const proposal = (await curate("status")).curation.pendingProposal;
+    assert.equal(proposal.runId, started.runId);
+    const revision = await curate("revise", { proposalId: proposal.id, feedback: "按新要求核验" });
+    assert.equal(revision.hostAction.tool, "post_message");
+    assert.match(revision.hostAction.args.text, /上版问题[\s\S]*按新要求核验/);
+    await o.getBootstrap(args);
+    assert.equal((await curate("status")).curation.awaitingHost, true);
+    write(appDataDir, boardPath, first + board(2, name, none));
+    await o.getBootstrap(args);
+    const state = (await curate("status")).curation;
+    assert.equal(state.running, false);
+    assert.equal(state.pendingProposal, null);
+    assert.equal(state.lastNoChange.runId, revision.runId);
+    assert.equal((await o.getBootstrap(args)).specCuration.lastNoChange.runId, revision.runId);
+    const removed = await curate("trigger");
+    assert.equal(removed.hostAction.tool, "post_message");
+    putRoster(name, "manual");
+    await o.getBootstrap(args);
+    assert.equal((await curate("status")).curation.awaitingHost, false);
+    write(appDataDir, `${systemDir}/swarm/members.json`, JSON.stringify({ members: {
+      coordinator: { role: "coordinator", conversation_id: conversationId },
+    } }));
+    await o.getBootstrap(args);
+    assert.equal((await curate("status")).curation.running, false);
+    assert.equal(fs.existsSync(path.join(dir, "control", "active-native-curators.json")), false);
+    await o.setConversationPolicy({ ...args, orchestrationMode: "complex" });
+    await curate("setAuto", { autoTrigger: true });
+    driver(o, () => completed("done"));
+    await o.delegateTask({ ...args, presetKey: "executor_codex", task: "work", mode: "wait" });
+    putRoster("worker", "manual");
+    await o.getBootstrap(args);
+    assert.deepEqual(await curate("stopHookCheck"), {});
+    putRoster("worker", "mentions");
+    const stops = await Promise.all([curate("stopHookCheck"), curate("stopHookCheck")]);
+    assert.equal(stops.filter(result => result.decision === "continue").length, 1);
+    assert.equal((await curate("cancelTicket")).cancelled, true);
+    assert.deepEqual(await curate("stopHookCheck"), {});
   } finally { await o.shutdown(); }
 }));
 

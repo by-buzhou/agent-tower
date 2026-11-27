@@ -543,6 +543,13 @@ export async function startCoreDaemon(options = {}) {
           sendJson(res, 400, { ok: false, error: "Missing RPC method" });
           return;
         }
+        if (rpcMethod === "specCuration" &&
+            (req.headers["x-agent-tower-surface"] === "mcp" || rpcParams._agentTowerSurface === "mcp") &&
+            !["begin", "submit", "status"].includes(rpcParams.action)) {
+          sendJson(res, 403, { ok: false, code: "SPEC_CURATION_SURFACE_FORBIDDEN",
+            error: "MCP 仅可发起规范梳理和提交提案，管理操作请在 Studio 执行" });
+          return;
+        }
 
         if (["__shutdown", "__prepareCutover", "__commitUpdate", "__finishUpdate"].includes(rpcMethod)) {
           if (!hasValidToken || rpcParams._standalone === true) {

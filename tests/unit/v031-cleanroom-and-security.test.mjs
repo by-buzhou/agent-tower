@@ -242,7 +242,8 @@ test("first-run roster uses configured and live models before static presets", (
   assert.equal(presets.curator_codex.permissionMode, "read-only");
   assert.equal(presets.executor_kimi.model, "kimi-code/live");
   assert.equal(presets.advisor_agy.model, "gemini-4-neon");
-  assert.equal(presets.curator_agy, undefined);
+  assert.equal(presets.curator_agy.model, "gemini-4-neon");
+  assert.equal(presets.curator_agy.isolation, "shared");
   const fallback = buildInitialRosterFromProbe({ binaries, catalog: { providers: [
     { id: "codex", catalogSource: "builtin", models: [{ slug: "gpt-unprobed" }] },
   ] } }).presets;

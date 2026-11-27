@@ -264,7 +264,7 @@ export async function cutover(options = production, delayMs = 0) {
       "updates",
     ]);
     const garbage =
-      /^(state\.sqlite(?:-(?:shm|wal|journal))?|daemon\.log(?:\.1)?|worktrees|archive-legacy|.*\.tmp)$/i;
+      /^(state\.sqlite(?:-(?:shm|wal|journal))?|daemon\.log(?:\.1)?|active-native-curators\.json|worktrees|archive-legacy|.*\.tmp)$/i;
     const assertNoUpdateInProgress = () => {
       if (fs.existsSync(child(control, "updates", "apply.lock"))) {
         throw Object.assign(new Error("System update in progress"), { code: "UPDATE_IN_PROGRESS" });
@@ -300,6 +300,10 @@ export async function cutover(options = production, delayMs = 0) {
         });
     phase = "start-and-probe";
     const { pid, port } = await client.ensureDaemon({ dataDir: control });
+    const postDeadline = Date.now() + 3000;
+    while ((fs.existsSync(spawnLock) || fs.existsSync(reclaimLock)) && Date.now() < postDeadline) {
+      await delay(40);
+    }
     const health = await fetch(`http://127.0.0.1:${port}/healthz`, {
       signal: AbortSignal.timeout(5000),
     }).then((r) => r.json());

@@ -89,11 +89,12 @@ test("真实 RPC 保持空白项目零写盘并报告镜像篡改与恢复", () 
     const nonRpcKeys = new Set(["version", "db", "engineManager", "hasActiveRuns", "setStudioUrl", "getStudioUrl",
       "resolveConversationRoot", "matchesEventConversation", "subscribe", "handleRpc", "shutdown"]);
     assert.equal(Object.keys(o).filter(key => !nonRpcKeys.has(key)).length, 40);
-    assert.equal(MCP_TOOLS.length, 16);
+    assert.equal(MCP_TOOLS.length, 17);
     const tool = name => MCP_TOOLS.find(item => item.name === name).inputSchema.properties;
     assert.ok(tool("delegate_task").role.enum.includes("curator"));
     assert.ok(tool("delegate_parallel_batch").tasks.items.properties.role.enum.includes("curator"));
-    assert.ok(MCP_TOOLS.every(item => !/specCuration|spec_curation|systemUpdate|system_update/.test(item.name)));
+    assert.deepEqual(tool("spec_curation").action.enum, ["begin", "submit"]);
+    assert.ok(MCP_TOOLS.every(item => !/specCuration|systemUpdate|system_update/.test(item.name)));
   } finally { await o.shutdown(); }
 }));
 

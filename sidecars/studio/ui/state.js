@@ -254,9 +254,10 @@ export const MEMBER_GROUPS = [
 export const MEMBER_GROUP_IDS = ['advisor', 'executor', 'reviewer', 'curator'];
 /** v0.2.11 可派发三组：规范维护组不是派发阶段（仅由「✨ 维护规范」/ 项目级自动维护拉起），不进入派发勾选池。 */
 export const DISPATCH_GROUP_IDS = ['advisor', 'executor', 'reviewer'];
-/** 规范维护组排除宿主原生引擎（后台收尾与面板按钮无法脱离宿主活跃轮次拉起原生 swarm）。 */
+/** 规范维护组引擎校验：放行外部 CLI 与宿主原生（antigravity / agy），仅拦截宿主内部伪 ID。 */
 export function isCuratorBlockedProvider(provider) {
-  return ['antigravity', 'agy', 'host', 'antigravity-host'].includes(String(provider || '').trim().toLowerCase());
+  const id = String(provider || '').trim().toLowerCase();
+  return !id || ['host', 'antigravity-host', 'commander', 'coordinator'].includes(id);
 }
 /** v0.1.0 旧版组策略 / 翻译目标：仅作存量设置迁移到 modeProfiles 的只读输入（v0.1.1 起前端不再编辑、不再提交）。 */
 export const DEFAULT_MEMBER_POOL = {
@@ -365,7 +366,7 @@ export function normalizeClientModeProfiles(rawProfiles, presets, legacyMemberPo
         preferredKey = mode === 'relay' && legacyRelayTarget ? legacyRelayTarget : legacyStar || base.preferredKey;
         if (!enabledKeys.length && group !== 'executor') stageEnabled = false;
       }
-      enabledKeys = enabledKeys.filter((k) => belongs(k, group) && !(group === 'curator' && isCuratorBlockedProvider(known?.[k]?.provider)));
+      enabledKeys = enabledKeys.filter((k) => belongs(k, group) && !(known && group === 'curator' && isCuratorBlockedProvider(known[k]?.provider)));
       if (group === 'executor' && !enabledKeys.length) {
         const fallback = [preferredKey, base.preferredKey, ...(known ? groupMembersInOrder(group, known).map(({ key }) => key) : base.enabledKeys)]
           .find((k) => k && belongs(k, group));
@@ -1129,7 +1130,12 @@ export function normalizeSpecArchive(raw) {
 }
 /** specEnabled 缺省 true：旧守护进程 / 旧测试桩未下发该字段时保持既有规范面板行为。 */
 export function emptySpecCuration(workspace = '') {
-  return { workspace, specEnabled: true, archive: emptySpecArchive(), autoTrigger: false, singleMaxKb: DEFAULT_SPEC_SINGLE_KB, totalMaxKb: DEFAULT_SPEC_TOTAL_KB, running: false, activeThreadId: null, activeRunId: null, lastNoChange: null, pendingProposal: null, recentProposals: [] };
+  return {
+    workspace, specEnabled: true, archive: emptySpecArchive(), autoTrigger: false,
+    singleMaxKb: DEFAULT_SPEC_SINGLE_KB, totalMaxKb: DEFAULT_SPEC_TOTAL_KB,
+    running: false, awaitingHost: false, activeHandoffId: null, activeExecutorKind: null,
+    activeThreadId: null, activeRunId: null, lastNoChange: null, pendingProposal: null, recentProposals: [],
+  };
 }
 function curationText(v) {
   return typeof v === 'string' ? v : v == null ? '' : String(v);
@@ -1157,6 +1163,7 @@ export function normalizeSpecProposal(raw) {
   return {
     id: String(raw.id), status: curationText(raw.status) || 'pending', summary: curationText(raw.summary),
     threadId: curationText(raw.threadId), runId: curationText(raw.runId), triggerSource: curationText(raw.triggerSource) || 'manual',
+    executorKind: curationText(raw.executorKind),
     changes, preflightIssues: curationIssues(raw.preflightIssues), parseError,
     preflightOk: raw.preflightOk !== false && !parseError && changes.length > 0 && changes.every((c) => c.preflightOk),
     createdAt: Number(raw.createdAt) || 0, updatedAt: Number(raw.updatedAt) || 0, resolvedAt: Number(raw.resolvedAt) || 0,
@@ -1181,6 +1188,9 @@ export function normalizeSpecCuration(raw, fallbackWorkspace = '') {
     singleMaxKb,
     totalMaxKb,
     running: raw.running === true,
+    awaitingHost: raw.awaitingHost === true,
+    activeHandoffId: raw.activeHandoffId ? String(raw.activeHandoffId) : null,
+    activeExecutorKind: raw.activeExecutorKind ? String(raw.activeExecutorKind) : null,
     activeThreadId: raw.activeThreadId ? String(raw.activeThreadId) : null,
     activeRunId: raw.activeRunId ? String(raw.activeRunId) : null,
     lastNoChange: noChange ? { reason: curationText(noChange.reason), at: Number(noChange.at || noChange.completedAt || noChange.createdAt) || 0 } : null,

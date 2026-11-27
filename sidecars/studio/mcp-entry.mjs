@@ -218,6 +218,27 @@ const BATCH_TASK_PROPERTIES = Object.fromEntries(Object.entries(DELEGATE_TASK_PR
 
 export const MCP_TOOLS = Object.freeze([
   {
+    name: 'spec_curation',
+    description: '仅在用户明确要求维护项目规范时调用。begin 获取只读准则，submit 送交 Studio 预检及用户确认。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['begin', 'submit'] },
+        cwd: { type: 'string' },
+        conversationId: { type: 'string' },
+        sessionId: { type: 'string' },
+        note: { type: 'string' },
+        status: { type: 'string', enum: ['propose', 'no_change'] },
+        summary: { type: 'string' },
+        reason: { type: 'string' },
+        changes: { type: 'array', items: { type: 'object' } },
+        rawText: { type: 'string' },
+      },
+      required: ['action', 'cwd'],
+      additionalProperties: false,
+    },
+  },
+  {
     name: 'orchestrator_capabilities',
     description:
       '查询本机核心引擎（Kimi Code / Codex / Claude Code / Antigravity）及开放扩展平台的可用状态、完整脱敏模型目录与成员池预设；仅在需要核对引擎、模型或阵容时调用。',
@@ -734,7 +755,8 @@ function slimActiveMode(activeMode) {
 // A native dispatch card already carries tool + args; the host-facing prompt must not repeat the whole brief again.
 function slimHostAction(action) {
   if (!action || typeof action !== 'object' || !action.handoffId || !action.tool) return action;
-  return { ...action, hostPrompt: `请执行宿主原生派遣票据 #${action.handoffId}：按 args 调用 ${action.tool}。严禁调用 agentapi new-conversation 或 agy acp。` };
+  const prefix = action.role === 'curator' ? `[AgentTower Curation Ticket #${action.handoffId}]\n` : '';
+  return { ...action, hostPrompt: `${prefix}请执行宿主原生派遣票据 #${action.handoffId}：按 args 调用 ${action.tool}。严禁调用 agentapi new-conversation 或 agy acp。` };
 }
 
 function slimDispatchResult(result, { keepCards = true } = {}) {
@@ -813,11 +835,31 @@ function formatMcpToolError(message) {
 }
 
 export async function executeMcpToolCall(toolName, rawArgs = {}) {
-  const { daemonRpc, ensureDaemon } = await getDaemonClientModule();
+  const client = await getDaemonClientModule();
+  const { ensureDaemon } = client;
+  const daemonRpc = (method, params) => client.daemonRpc(method, { ...params, _agentTowerSurface: 'mcp' });
   const args = withHostContext(rawArgs);
   const formatMcpToolSuccess = (payload) => formatToolSuccess(payload, toolName);
 
   switch (toolName) {
+    case 'spec_curation': {
+      if (!['begin', 'submit'].includes(args.action) || typeof args.cwd !== 'string' || !args.cwd.trim()) {
+        return formatMcpToolError('spec_curation 需要 begin 或 submit 及项目 cwd');
+      }
+      const { port, token } = await ensureDaemon();
+      const response = await fetch(`http://127.0.0.1:${port}/rpc`, {
+        method: 'POST',
+        redirect: 'error',
+        signal: AbortSignal.timeout(10_000),
+        headers: { 'Content-Type': 'application/json', 'X-Daemon-Token': token, 'X-Agent-Tower-Surface': 'mcp' },
+        body: JSON.stringify({ method: 'specCuration', params: args }),
+      });
+      const payload = await response.json();
+      if (!response.ok || !payload.ok) {
+        return formatMcpToolError([payload.code, payload.error || `HTTP ${response.status}`].filter(Boolean).join(': '));
+      }
+      return formatMcpToolSuccess(payload.result);
+    }
     case 'orchestrator_capabilities': {
       const res = await daemonRpc('getCapabilities', args);
       return formatMcpToolSuccess(res);

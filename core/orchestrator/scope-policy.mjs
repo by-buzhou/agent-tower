@@ -317,17 +317,43 @@ export function createScopePolicyModule(ctx) {
     return null;
   }
 
-  function hostToolGate(root, params, settings, readActiveMode) {
-    if (params.hostToolName !== "swarm") return {};
+  function hostToolGate(root, params, settings, readActiveMode, workspace) {
+    const toolName = params.hostToolName;
+    if (!["swarm", "invoke_subagent"].includes(toolName)) return {};
     const args = params.hostToolArgs || {};
+    const caller = String(params.conversationId || "").toLowerCase();
+    const nativeKind = toolName === "swarm" ? "swarm" : "subagent";
+    const curationTicket = root && ctx.dispatch?.findNativeHandoff({ rootConversationId: root, nativeKind, role: "curator",
+      unboundWorkspace: workspace, includeClaimed: true, requireUnique: true,
+      matchesToolArgs: action => action.tool === toolName && Object.entries(action.args).every(([key, value]) => args[key] === value) });
+    if (curationTicket) {
+      if (caller === root.toLowerCase() && !curationTicket.admittedAt &&
+          ctx.specs.admitNativeCuration(curationTicket, root)) {
+        return { hostToolAllowed: true, curationTicketAllowed: true, handoffId: curationTicket.handoffId };
+      }
+      return { hostToolAllowed: false, hostToolReason: "规范维护票据仅可由对应主会话执行一次。" };
+    }
+    if ([args.Prompt, args.brief].some(value => typeof value === "string" &&
+        value.startsWith("[AgentTower Curation Ticket #"))) {
+      return { hostToolAllowed: false, hostToolReason: "规范维护需要有效的原生派遣票据。" };
+    }
+    const presets = settings.presets || {};
+    if (toolName === "invoke_subagent") {
+      const label = String(args.Role || "").trim().toLowerCase();
+      const curator = label && Object.entries(presets).some(([key, preset]) => preset.group === "curator" &&
+        preset.provider === "antigravity" && [key, preset.label, preset.title].some(value => String(value || "").toLowerCase() === label));
+      return curator ? { hostToolAllowed: false, hostToolReason: "规范维护需要有效的原生派遣票据。" } : {};
+    }
     if (args.action !== "add") return { hostToolAllowed: true };
     const name = String(args.name || "").trim().toLowerCase();
     if (!name) return { hostToolAllowed: true };
-    const presets = settings.presets || {};
     const canonical = value => String(value || "").replace(/-/g, "_").toLowerCase();
     const presetKey = Object.keys(presets).find(key => presets[key].provider === "antigravity" &&
       [key, swarmMemberName(key)].some(value => canonical(value) === canonical(name)));
     if (!presetKey) return { hostToolAllowed: true };
+    if (presets[presetKey].group === "curator") {
+      return { hostToolAllowed: false, hostToolReason: "规范维护需要有效的原生派遣票据。" };
+    }
     const active = readActiveMode();
     const enabled = Object.values(active.groups).some(group => group.enabledKeys.includes(presetKey));
     const ticket = ctx.dispatch?.findNativeHandoff({ rootConversationId: root, presetKey, swarmName: name, nativeKind: "swarm" });
@@ -393,7 +419,7 @@ export function createScopePolicyModule(ctx) {
         (swarmName.length === 24 && canonical(key.slice(0, 24)) === canonical(swarmName)))) || "" : "");
     const ticket = !isSwarm || matchedPresetKey || swarmName
       ? ctx.dispatch?.claimNativeHandoff({ rootConversationId: root, presetKey: matchedPresetKey, swarmName,
-        nativeKind: isSwarm ? "swarm" : "subagent", conversationId: caller }) : null;
+        nativeKind: isSwarm ? "swarm" : "subagent", conversationId: caller, invocation: true }) : null;
     if (!thread && !member && !ticket) return { ...base, playbookInject: null };
     const workspace = inspectHostProjectRoot(ticket?.cwd || ticket?.repoRoot).root || hostProjectRoot(root, params);
     if (!workspace) return { ...base, playbookInject: null };
@@ -427,7 +453,8 @@ export function createScopePolicyModule(ctx) {
       thread?.title || member?.name || "";
     const specs = assembleSpecPrompt({ inventory, cwd: checkout, repoRoot, role, rawPrompt,
       dynamicPrompt: [ticket?.reviewFilesBlock, planWarning].filter(Boolean).join("\n\n"), selection, planDoc,
-      review: ticket?.reviewSpec, specEnabled, controlDir: ctx.dataDir });
+      review: ticket?.reviewSpec, specEnabled, controlDir: ctx.dataDir,
+      ...(role === "curator" && specEnabled ? ctx.specs.curatorPromptContext(repoRoot, root) : {}) });
     const planKey = specs.full.meta.items.find(item => item.kind === "plan")?.key;
     const budgetWarning = specs.full.meta.warnings.find(({ key }) => key === planKey);
     const playbookInject = [specs.full.prompt.trim(), budgetWarning && `【规划投递告警】${budgetWarning.code}：${singleLine(budgetWarning.message)}`]
@@ -454,7 +481,7 @@ export function createScopePolicyModule(ctx) {
     const counts = conversationWorkCounts(root);
     let activeMode;
     const readActiveMode = () => activeMode ??= getActiveModeSummary(root, { policy, settings, counts });
-    const responseBase = () => ({ ...policy, ...counts, ...hostToolGate(root, params || {}, settings, readActiveMode), activeMode: readActiveMode() });
+    const responseBase = () => ({ ...policy, ...counts, ...hostToolGate(root, params || {}, settings, readActiveMode, workspace), activeMode: readActiveMode() });
     if (params?.syncHostPlaybook !== true) return responseBase();
     if (params.confirmPlaybookToken) {
       const token = String(params.confirmPlaybookToken);
@@ -468,7 +495,14 @@ export function createScopePolicyModule(ctx) {
     }
     const caller = String(params.conversationId || "").trim().toLowerCase();
     if (!root || ctx.db.isManagedChildSession(params.conversationId)) return { ...responseBase(), playbookInject: null };
-    if (caller && caller !== root.toLowerCase()) return nativeChildPlaybook({ base: responseBase(), root, caller, params });
+    if (caller && caller !== root.toLowerCase()) {
+      const childPlaybook = () => nativeChildPlaybook({ base: responseBase(), root, caller, params });
+      // The first child hook may beat the watcher to the parent's invoke_subagent receipt.
+      if (params.deferPlaybookCommit && ctx.dispatch.findNativeHandoff({ rootConversationId: root, nativeKind: "subagent", role: "curator" })) {
+        return ctx.hostSync.syncNativeHostConversation(root, { workspace, appDataDir: params.appDataDir }).then(childPlaybook);
+      }
+      return childPlaybook();
+    }
 
     const specEnabled = Boolean(workspace && ctx.db.isProjectSpecEnabled(workspace));
     recordActiveHost(root, params, workspace || null);

@@ -5782,6 +5782,14 @@ button.mode-flow-stage:hover {
   background: var(--sw-fill);
   color: var(--sw-fg-muted);
 }
+.ps-curation-status--row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px 8px;
+  min-width: 0;
+}
 .ps-curation-card {
   display: flex;
   flex-direction: column;
