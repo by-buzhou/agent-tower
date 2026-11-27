@@ -1,11 +1,5 @@
 # AgentTower v0.3.3.2
 
-<p>
-  <a href="https://linux.do?ref=seal-click" target="_blank" rel="noopener noreferrer" title="Powered by LINUX DO">
-    <img src="https://linuxdo-seal.cuishushu.com/seals/seal-powered-by.svg" alt="Powered by LINUX DO" width="180" height="55" />
-  </a>
-</p>
-
 专为 **Antigravity** 打造的多 Agent 协作编程插件 —— 充分发挥 **Gemini 4** 语言理解与表达优势，在 **AgentTower** 本地面板一站式完成多路派单、军师会审与代码审改。
 
 ---
@@ -230,10 +224,17 @@ npm run status:plugin
 
 ## 致谢与许可
 
-本项目源码独立实现，部分架构与交互思路受到以下工具及开源项目的启发，特此致谢：
+**项目想法与来源参考**（本项目源码独立实现，特此致谢以下工具与开源项目带来的启发）：
 
+- **名字与想法**：Kimi Code 的 Tower 模式
 - **面板与多成员协作交互**：参考 Antigravity 原生 Swarm 模式
 - **子 Agent 调度与协议思路**：参考 T3Code 与 Agent Client Protocol (ACP) 协议生态
 - **项目规范（Spec）上下文治理**：参考 Trellis、OpenSpec 等开源项目
 
 本地数据边界、凭据保存注意事项与安全问题反馈方式见 [SECURITY.md](SECURITY.md)。Copyright (C) 2026 AgentTower Team，本项目以 [AGPL-3.0](LICENSE)（`AGPL-3.0-only`）许可发布；文中涉及的 Antigravity、Claude Code、OpenAI Codex、Kimi Code 等第三方产品名称与商标归各自所有者所有，本项目仅通过其公开本地接口进行调度，与各权利人无背书或隶属关系。
+
+<p>
+  <a href="https://linux.do?ref=seal-click" target="_blank" rel="noopener noreferrer" title="Powered by LINUX DO">
+    <img src="https://linuxdo-seal.cuishushu.com/seals/seal-powered-by.svg" alt="Powered by LINUX DO" width="180" height="55" />
+  </a>
+</p>
