@@ -200,23 +200,26 @@ function mutationDecision(toolName, args, conversationId, cwd, workspacePaths) {
   return allow;
 }
 
-let decision = allow;
+const unreadable = { decision: 'deny', reason: '工具请求未能完整读取，无法核验写入或派遣权限。' };
+let decision = unreadable;
 try {
   // Limit both waiting and input size, including when a host leaves stdin open.
   const chunks = [];
   let size = 0;
-  const unreadable = { decision: 'deny', reason: '工具请求未能完整读取，无法核验写入或派遣权限。' };
-  const stdinDeadline = setTimeout(() => { decision = unreadable; process.stdin.destroy(); }, 1000);
+  let timedOut = false;
+  const stdinDeadline = setTimeout(() => { timedOut = true; process.stdin.destroy(); }, 1000);
   try {
     for await (const chunk of process.stdin) {
       size += chunk.length;
-      if (size > 1024 * 1024) { decision = unreadable; throw new Error('Hook input too large'); }
+      if (size > 1024 * 1024) throw new Error('Hook input too large');
       chunks.push(chunk);
     }
   } finally {
     clearTimeout(stdinDeadline);
   }
+  if (timedOut) throw new Error('Hook input timed out');
   const input = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+  if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('Malformed hook payload');
   const toolName = input.toolCall?.name ?? input.toolCall?.toolName ?? input.toolCall?.function?.name;
   const conversationId = typeof input.conversationId === 'string' ? input.conversationId.trim() : '';
   const workspacePaths = Array.isArray(input.workspacePaths) ? input.workspacePaths.filter(p => typeof p === 'string') : [];
@@ -227,18 +230,20 @@ try {
     try { hostToolArgs = JSON.parse(rawArgs) || {}; }
     catch { hostToolArgs = {}; }
   }
+  let nextDecision = allow;
   // The matcher also handles hosts that omit the tool name from the payload.
   if (!toolName || writeTools.has(toolName) || toolName === 'run_command') {
-    decision = mutationDecision(toolName || 'write_file', hostToolArgs, conversationId, input.cwd, workspacePaths);
+    nextDecision = mutationDecision(toolName || 'write_file', hostToolArgs, conversationId, input.cwd, workspacePaths);
   }
-  if (decision === allow && process.env.AGENT_TOWER_MANAGED_AGY_ACP !== '1' && (!toolName || guardedTools.has(toolName))) {
+  if (nextDecision === allow && process.env.AGENT_TOWER_MANAGED_AGY_ACP !== '1' && (!toolName || guardedTools.has(toolName))) {
     const policy = await daemonPolicy({ conversationId, workspace: workspacePaths[0] || input.cwd, hostToolName: toolName, hostToolArgs }) ??
       await offlinePolicy(conversationId, [...workspacePaths, input.cwd].filter(Boolean), toolName, hostToolArgs).catch(() => false);
     const enabled = typeof policy === 'object' ? policy.dispatchEnabled : policy;
-    if (policy?.hostToolAllowed === false) decision = { decision: 'deny', reason: policy.hostToolReason };
-    else if (!enabled && policy?.curationTicketAllowed !== true) decision = deny;
+    if (policy?.hostToolAllowed === false) nextDecision = { decision: 'deny', reason: policy.hostToolReason };
+    else if (!enabled && policy?.curationTicketAllowed !== true) nextDecision = deny;
   }
+  decision = nextDecision;
 } catch {
-  // The host contract requires one fail-open response even for malformed input/storage.
+  decision = unreadable;
 }
 process.stdout.write(JSON.stringify(decision) + '\n');
