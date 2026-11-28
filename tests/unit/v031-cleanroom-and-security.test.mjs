@@ -103,28 +103,34 @@ const acpFixture = [
   '}',
 ].join("\n");
 
-test("generic ACP retries model selection, warns when both calls fail and denies unresolved permissions", () => withProjectSandbox("v031-acp", async dir => {
+test("generic ACP retries model selection, fails fast when both calls fail and denies unresolved permissions", () => withProjectSandbox("v031-acp", async dir => {
   const script = path.join(dir, "acp.mjs");
   write(script, acpFixture);
-  for (const [scenario, model, expectedModelCalls, expectedWarning, expectedOption] of [
-    ["failure", "requested", ["session/set_config_option", "session/set_model"], true, "no"],
-    ["fallback", "requested", ["session/set_config_option", "session/set_model"], false, "yes"],
-    ["inherited", "inherit", [], false, "no"],
+  for (const [scenario, model, expectedModelCalls, expectedStatus, expectedOption] of [
+    ["failure", "requested", ["session/set_config_option", "session/set_model"], "failed", undefined],
+    ["fallback", "requested", ["session/set_config_option", "session/set_model"], "completed", "yes"],
+    ["inherited", "inherit", [], "completed", "no"],
+    ["no-handler", "default", [], "completed", "no"],
   ]) {
     const events = [];
     let handle;
-    const onPermissionRequest = scenario === "failure" ? req => { void handle.respondPermission(req.requestId, undefined); } :
+    const onPermissionRequest = scenario === "inherited" ? req => { void handle.respondPermission(req.requestId, undefined); } :
       scenario === "fallback" ? () => "allow" : undefined;
     handle = runGenericAcpTurn({ cwd: dir, provider: "fixture-acp", providerConfig: { command: script, args: [scenario] },
       prompt: "test", model, permissionMode: "default", onPermissionRequest, onEvent: event => events.push(event) });
-    try { assert.equal((await within(handle.result, 8000, scenario)).status, "completed"); }
-    finally { await handle.forceKill(); }
+    let res;
+    try {
+      res = await within(handle.result, 8000, scenario);
+      assert.equal(res.status, expectedStatus, scenario);
+    } finally { await handle.forceKill(); }
     const frames = fs.readFileSync(path.join(dir, scenario + ".jsonl"), "utf8").trim().split("\n").map(JSON.parse);
     assert.deepEqual(frames.map(f => f.method).filter(m => ["session/set_config_option", "session/set_model"].includes(m)), expectedModelCalls);
-    assert.deepEqual(frames.find(f => f.id === "perm").result, { outcome: { outcome: "selected", optionId: expectedOption } });
-    const warning = events.find(evt => evt.itemId === "acp-model-warning");
-    assert.equal(Boolean(warning), expectedWarning);
-    if (warning) assert.match(warning.delta, /requested.*当前模型/);
+    if (expectedStatus === "failed") {
+      assert.equal(res.code, "ACP_MODEL_SWITCH_FAILED");
+      assert.equal(frames.some(f => f.method === "session/prompt"), false);
+    } else {
+      assert.deepEqual(frames.find(f => f.id === "perm").result, { outcome: { outcome: "selected", optionId: expectedOption } });
+    }
   }
 }));
 

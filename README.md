@@ -1,4 +1,4 @@
-# AgentTower v0.3.4
+# AgentTower v0.3.5
 
 专为 **Antigravity** 打造的多 Agent 协作编程插件 —— 充分发挥 **Gemini 4** 语言理解与表达优势，在 **AgentTower** 本地面板一站式完成多路派单、军师会审与代码审改。
 
@@ -6,7 +6,7 @@
 
 ## 为什么要用 AgentTower？
 
-在 Antigravity 中写代码时，Gemini 4 拥有极佳的意图理解、全局拆解与中文沟通体验；但遇到跨模块并行开发、复杂架构取舍，或想联合 **Claude Code、OpenAI Codex、Kimi Code** 等不同专长引擎协同作战时，来回切终端贴上下文既割裂又容易串台。
+在 Antigravity 中写代码时，Gemini 4 拥有极佳的意图理解、全局拆解与中文沟通体验；但遇到跨模块并行开发、复杂架构取舍，或想联合 **Claude Code、OpenAI Codex、Kimi Code、OpenCode、DeepSeek Harness (DSH)、ZCode** 等国内外主流编程 Agent 协同作战时，来回切终端贴上下文既割裂又容易串台。
 
 **AgentTower 的核心思路是「主帅居中统筹 + 异构专兵热插拔协同」**：
 让 **Gemini 4 坐镇主对话框**负责对齐需求、拆解施工图并用通俗人话汇报全局；同时在侧栏（或独立浏览器宽屏）挂载统一的本地协作面板，自由混编调度宿主原生成员与外部编程 Agent 并行实战——**小事零打扰，大事真并发，角色模型随心换，记忆全留本地项目。**
@@ -87,9 +87,10 @@
 | **Antigravity 内置子成员**<br>*(Gemini 4 / Orchestrator)* | **宿主原生接口直调**<br>`swarm` + `invoke_subagent` | 锁模型/思考档位或多轮具名驻留走原生 `swarm`（支持 `@name` 秒级唤醒），轻量单次委派走 `invoke_subagent`；面板只读追踪转录流实时同步进度，不拉起外部桥接进程，绝不在宿主乱开顶层窗口。 |
 | **OpenAI Codex** | **本地 `app-server` 双向协议** | 支持运行中 `⚡ Steer` 实时热注入纠偏、原生 `read-only` 沙盒诊断与审改一体闭环。 |
 | **Claude Code** | **双向 `stream-json` 控制流** | 支持运行中实时 `Steer`、面板内交互式工具权限审批（`can_use_tool`）与追问回填。 |
-| **Kimi Code 及开放扩展引擎**<br>*(OpenCode / Gemini CLI / Qwen Code / Cursor 等)* | **标准 ACP v1 协议 / 可配置 CLI** | 通过标准 Agent Client Protocol v1 能力协商底座（含版本/登录指引/会话恢复与分组模型发现）或扩展模板即插即用；内置 `codex / kimi` 单次预初始化备机槽加速冷启动，统一接入默认拒绝（Fail-Closed）审批门禁与进程树两阶段安全停止。 |
+| **Kimi Code 与标准 ACP v1 生态**<br>*(OpenCode / DSH / Gemini CLI / Qwen Code / Cursor / Grok / Kiro / Goose)* | **标准 ACP v1 协议协商底座** | 共享标准 Agent Client Protocol v1 底座（自动适配 OpenCode `build/plan` 模式、DSH `--profile acp` 权限沙盒与二元组模型映射，握手即按模型动态采集各自独立的思考档位与渠道分组）；内置 `codex / kimi` 单次预初始化备机槽加速冷启动，统一接入默认拒绝（Fail-Closed）审批门禁与进程树两阶段安全停止。 |
+| **ZCode (智谱 Z.ai) 与通用 CLI**<br>*(ZCode 桌面端·CLI / Aider / 自定义 CLI)* | **官方 `app-server` 裸 NDJSON / CLI 模板** | 内置轻量 ZCode 官方协议驱动，自动发现 PATH 或桌面安装包并直出每款模型的真实上下文窗口（如 `1M / 256k`）、可读渠道分组与独立思考档位，对索要凭据或浏览器的反向 RPC 一律硬拒；全扩展平台支持面板一键切换 `极简隔离 (minimal) / 继承系统 (inherit)` 子进程变量隔离，且全程**零扫描用户 `~/.xxx` 凭据目录**。 |
 
-> 实际可用模型取决于本机已安装的引擎及其自身登录授权，AgentTower 严格透传各引擎原生权限档位，绝不越界绕过授权边界。
+> 实际可用模型取决于本机已安装的引擎及其自身登录授权；AgentTower 仅在子进程握手时接收各引擎主动上报的模型元数据，绝不读取第三方客户端本地密钥文件，也绝不越界绕过各引擎原生授权边界。
 
 ---
 
@@ -104,7 +105,7 @@
 **第 1 句（安装挂载 + 预扫本机 Agent 环境）**：
 
 ```text
-请帮我安装并配置 AgentTower 插件：先检查本机 Node.js（需 >= 24.0.0）与 Git 环境，并扫描 PATH 中已安装的编程 Agent CLI（如 claude、codex、kimi、opencode、gemini、qwen、cursor、aider、goose、kiro）；接着将 https://github.com/by-buzhou/agent-tower.git 克隆到用户目录下的 ~/.agent-tower/src（若已存在则拉取最新代码），进入该目录执行 npm run setup 和 npm run status:plugin。确认守护进程 live 为 true 后，列出本机已检测到的 Agent 清单，并提醒我重载一次 Antigravity 窗口以完成自动配阵。
+请帮我安装并配置 AgentTower 插件：先检查本机 Node.js（需 >= 24.0.0）与 Git 环境，并扫描本机已安装的编程 Agent（如 claude、codex、kimi、opencode、dsh、zcode、gemini、qwen、cursor、aider、goose、kiro）；接着将 https://github.com/by-buzhou/agent-tower.git 克隆到用户目录下的 ~/.agent-tower/src（若已存在则拉取最新代码），进入该目录执行 npm run setup 和 npm run status:plugin。确认守护进程 live 为 true 后，列出本机已检测到的 Agent 清单，并提醒我重载一次 Antigravity 窗口以完成自动配阵。
 ```
 
 **第 2 句（重载窗口后，让 AI 自动握手并配好全部可用引擎与阵容）**：
@@ -196,7 +197,7 @@ npm run setup
 - **新对话与新项目默认策略**：
   - **新对话默认模式**：设置每次新开 Antigravity 聊天窗口时的初始档位（推荐保持默认的 `直出`，日常问答零打扰，需要多 Agent 时再在顶栏点开）；
   - **新项目默认开启项目规范（Spec）**：控制首次接触的新项目是否默认启用 Spec 体系（不影响已有项目）；
-  - **子 Agent 在外部客户端列表中可见（默认）**：全局控制外部 CLI 会话默认无痕隐藏还是保留可见。
+  - **子 Agent 在外部客户端列表中可见**：默认关闭。支持删除或无痕运行的引擎会清理或跳过外部历史；标有「本地保留历史」的扩展每轮新开会话，原生客户端仍可能显示记录。开启可见性后，支持恢复的引擎可续接原会话。
 - **界面外观主题**：支持 **`跟随宿主 / 暗色 / 亮色`** 三档切换（也可直接点顶栏右上角太阳/月亮按钮一键翻转明暗）。
 - **版本与更新**：默认开启低频自动检测（仅提示不静默改动，也可随时点 **`↻ 立即检测`**）。检测到新版后会出现 **`⬇ 下载并热更新`** 按钮——点击确认后，系统在隔离区完成 SHA-256 校验与沙盒自检，等当前所有在途任务自然跑完再平滑热切守护进程；若新版探活失败会自动回退，升级后也可随时点击 **`↺ 回滚至上一版`** 秒退旧版。
 
@@ -205,11 +206,12 @@ npm run setup
 ![全局配置 - 扩展平台：已检测第三方 CLI 一键启用、模板库与自定义接入](.github/readme/08-global-extensions.png)
 
 - **默认成员池**（第 2 子页）：交互与项目配置的「成员与阵容」完全相同，但这里编辑的是**全局默认母版**——之后打开任何未单独定制的新项目都会自动继承这套角色与模型阵容。
-- **扩展平台**（第 3 子页，如上图）：除内置直连的 Antigravity、Claude Code、Codex、Kimi Code 四大核心引擎外，面板内置了 **OpenCode、Gemini CLI、Qwen Code、Aider、Cursor Agent、Grok CLI、Kiro CLI、Goose** 扩展模板：
-  - 本机已安装对应 CLI 时会自动归入上方 `已接入` 区并标出 **`本机已检测`**，直接点 **`启用`** 即可完成握手接入；
+- **扩展平台**（第 3 子页，如上图）：除内置直连的 Antigravity、Claude Code、Codex、Kimi Code 四大核心引擎外，面板开箱内置 **OpenCode、DeepSeek Harness (DSH)、ZCode (Z.ai / 智谱)、Gemini CLI、Qwen Code、Aider、Cursor Agent、Grok CLI、Kiro CLI、Goose** 扩展模板：
+  - **零凭据目录扫描 & 真实单模型能力拉取**：仅检测可执行文件本身（如 `opencode acp`、`dsh --profile acp` 及 ZCode 桌面端/CLI `app-server --stdio`），绝不扫描或读取 `~/.opencode`、`~/.dsh`、`~/.zcode` 等第三方点目录；命中后自动归入上方 `已接入` 区并标出 **`本机已检测`**，点击 **`启用`** 即握手拉取真实模型列表、可读渠道分组、真实上下文窗口（如 `1M / 256k`，未上报容量的引擎自动隐藏标签不标假值）及**每款模型各自独立的思考档位**（选模下拉框随模型实时联动）；
+  - **可切换环境变量隔离策略（`envPolicy`）**：扩展列表行与配置弹窗均支持一键切换 **`极简隔离`（`minimal`）** 与 **`继承系统`（`inherit`）**——DSH 与 ZCode 默认极简隔离（仅透传系统基础运行环境与本平台环境变量前缀，剥离系统里其他无关厂商的密钥），OpenCode 默认继承终端环境，随时可按需切回；不支持删除外部原生历史的引擎会诚实标注 **`本地保留历史`**；
   - 可执行文件不在默认 `PATH` 时，点开下方 **`可接入模板库`** 对应行的 **`配置`** 填写路径或环境变量（凭据仅存本地控制目录，面板脱敏不回显）；
-  - 接入其他支持标准 ACP（JSON-RPC over Stdio）或命令行占位符模板的工具时，点右上角 **`+ 自定义`** 按向导填入命令并探测通过即可保存进角色池调度。
-- **引擎目录**（第 4 子页）：汇总查看本机当前已识别的全部引擎及各引擎下的可用模型 ID，支持顶部搜索框按名称即时过滤；新装了 CLI 或刚在终端登录切换了订阅账号后，点右上角 **`↻ 重新探测`** 即可同步最新模型列表。
+  - 接入其他支持标准 ACP（JSON-RPC over Stdio）、ZCode 官方协议或命令行占位符模板的工具时，点右上角 **`+ 自定义`** 按向导填入命令并探测通过即可保存进角色池调度。
+- **引擎目录**（第 4 子页）：汇总查看本机当前已识别的全部核心与扩展引擎、渠道分组、窗口容量与每款模型的专属思考档位，支持顶部搜索框按名称即时过滤；新装了 CLI 或刚在客户端切换了订阅/模型渠道后，点右上角 **`↻ 重新探测`** 即可一键重探核心与已启用扩展平台的最新模型元数据。
 
 ### 本地自检与状态查看
 
@@ -231,7 +233,7 @@ npm run status:plugin
 - **子 Agent 调度与协议思路**：参考 T3Code 与 Agent Client Protocol (ACP) 协议生态
 - **项目规范（Spec）上下文治理**：参考 Trellis、OpenSpec 等开源项目
 
-本地数据边界、凭据保存注意事项与安全问题反馈方式见 [SECURITY.md](SECURITY.md)。Copyright (C) 2026 AgentTower Team，本项目以 [AGPL-3.0](LICENSE)（`AGPL-3.0-only`）许可发布；文中涉及的 Antigravity、Claude Code、OpenAI Codex、Kimi Code 等第三方产品名称与商标归各自所有者所有，本项目仅通过其公开本地接口进行调度，与各权利人无背书或隶属关系。
+本地数据边界、凭据保存注意事项与安全问题反馈方式见 [SECURITY.md](SECURITY.md)。Copyright (C) 2026 AgentTower Team，本项目以 [Apache-2.0](LICENSE) 许可发布；文中涉及的 Antigravity、Claude Code、OpenAI Codex、Kimi Code、OpenCode、DeepSeek、ZCode 等第三方产品名称与商标归各自所有者所有，本项目仅通过其公开本地接口进行调度，与各权利人无背书或隶属关系。
 
 <p>
   <a href="https://linux.do?ref=seal-click" target="_blank" rel="noopener noreferrer" title="Powered by LINUX DO">

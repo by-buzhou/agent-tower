@@ -1,15 +1,15 @@
 import { PLUGIN_VERSION } from "./daemon-client.mjs";
 import { atomicJson, nativePath, ensureMainRoot } from "./storage-paths.mjs";
 import { readFile } from "node:fs/promises";
-import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { readFileSync, realpathSync, statSync } from "node:fs";
 import { createHash } from "node:crypto";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
   spawnNoWindow, captureNoWindow,
   buildCleanChildEnv, createNdjsonRpcConnection, detectCommandOnSystem,
-  resolveAgyBinary, resolveClaudeBinary, resolveCodexBinary, resolveHostAgentApiBinary, resolveKimiBinary, safeCatalogText,
-  forceKillProcessTree, flattenAcpOptions,
+  resolveAgyBinary, resolveClaudeBinary, resolveCodexBinary, resolveDshBinary, resolveHostAgentApiBinary, resolveKimiBinary, resolveZCodeBinary, safeCatalogText,
+  forceKillProcessTree, flattenAcpOptions, normalizeTokenLimit,
 } from "./engines/proc-utils.mjs";
 
 export const ROUTER_DEFAULT_MODEL = "__default__";
@@ -261,33 +261,85 @@ const BUILTIN_AGY_MODELS = [
 ];
 
 /**
- * Built-in Extension Hub Templates (7 mainstream external Agent platforms with auto-detection).
+ * Built-in Extension Hub Templates (10 mainstream external Agent platforms with binary-only auto-detection).
+ * Zero Dotfile Touch: NEVER probes or exposes `~/.xxx` credential/config directories.
  */
 export const BUILTIN_EXTENSION_TEMPLATES = Object.freeze([
   Object.freeze({
     id: "opencode",
     displayName: "OpenCode",
     protocol: "acp",
+    driverKind: "generic-acp",
     command: "opencode",
     args: Object.freeze(["acp"]),
     argsTemplate: "acp",
+    envPolicy: "inherit",
+    credentialEnvKeys: Object.freeze([
+      "OPENCODE_API_KEY",
+      "ANTHROPIC_API_KEY",
+      "OPENAI_API_KEY",
+      "DEEPSEEK_API_KEY",
+      "GEMINI_API_KEY",
+    ]),
+    ephemeralSupport: "delete",
+    efforts: Object.freeze(["low", "medium", "high"]),
     description: "开源终端编程 Agent 平台（标准 ACP 协议接入）",
     installHint: "npm install -g opencode-ai",
-    homeSubdir: ".opencode",
     defaultModels: Object.freeze([
-      Object.freeze({ slug: "opencode/default", name: "OpenCode Default", isDefault: true }),
+      Object.freeze({ slug: "default", name: "OpenCode Default", isDefault: true }),
+    ]),
+  }),
+  Object.freeze({
+    id: "dsh",
+    aliases: Object.freeze(["deepseek-harness"]),
+    displayName: "DeepSeek Harness (DSH)",
+    protocol: "acp",
+    driverKind: "generic-acp",
+    command: "dsh",
+    args: Object.freeze(["--profile", "acp"]),
+    argsTemplate: "--profile acp",
+    envPolicy: "minimal",
+    credentialEnvKeys: Object.freeze(["DEEPSEEK_API_KEY"]),
+    ephemeralSupport: "close-only",
+    efforts: Object.freeze(["off", "low", "high", "max"]),
+    description: "DeepSeek 官方终端 Agent Harness（标准 ACP 协议模式）",
+    installHint: "npm install -g @deepseek-ai/dsh",
+    defaultModels: Object.freeze([
+      Object.freeze({ slug: "default", name: "DSH Default", isDefault: true }),
+    ]),
+  }),
+  Object.freeze({
+    id: "zcode",
+    aliases: Object.freeze(["z-code", "zai-zcode"]),
+    displayName: "ZCode (Z.ai / 智谱)",
+    protocol: "zcode",
+    driverKind: "zcode",
+    command: "zcode",
+    args: Object.freeze(["app-server", "--stdio"]),
+    argsTemplate: "app-server --stdio",
+    envPolicy: "minimal",
+    credentialEnvKeys: Object.freeze(["ZAI_API_KEY", "ZHIPU_API_KEY"]),
+    ephemeralSupport: "close-only",
+    efforts: Object.freeze(["low", "medium", "high"]),
+    description: "智谱 Z.ai 官方编程 Agent（app-server stdio 官方协议，自动发现桌面端与 CLI）",
+    installHint: "安装 ZCode 桌面端或 zcode CLI",
+    defaultModels: Object.freeze([
+      Object.freeze({ slug: "default", name: "ZCode Default", isDefault: true }),
     ]),
   }),
   Object.freeze({
     id: "gemini-cli",
     displayName: "Gemini CLI",
     protocol: "acp",
+    driverKind: "generic-acp",
     command: "gemini",
     args: Object.freeze(["--acp"]),
     argsTemplate: "--acp",
+    envPolicy: "inherit",
+    credentialEnvKeys: Object.freeze(["GEMINI_API_KEY"]),
+    ephemeralSupport: "delete",
     description: "Google 官方开源 Gemini CLI（标准 ACP 协议模式）",
     installHint: "npm install -g @google/gemini-cli",
-    homeSubdir: ".gemini",
     defaultModels: Object.freeze([
       Object.freeze({ slug: "gemini-2.5-pro", name: "Gemini Pro", isDefault: true }),
       Object.freeze({ slug: "gemini-2.5-flash", name: "Gemini Flash" }),
@@ -298,10 +350,13 @@ export const BUILTIN_EXTENSION_TEMPLATES = Object.freeze([
     aliases: Object.freeze(["qwen"]),
     displayName: "Qwen Code",
     protocol: "acp",
+    driverKind: "generic-acp",
     command: "qwen",
     args: Object.freeze(["--acp"]),
     argsTemplate: "--acp",
-    homeSubdir: ".qwen",
+    envPolicy: "inherit",
+    credentialEnvKeys: Object.freeze(["DASHSCOPE_API_KEY", "OPENAI_API_KEY"]),
+    ephemeralSupport: "delete",
     installHint: "npm install -g @qwen-code/qwen-code",
     defaultModels: Object.freeze([
       Object.freeze({ slug: "qwen3-coder-plus", name: "Qwen3 Coder Plus", isDefault: true }),
@@ -311,12 +366,15 @@ export const BUILTIN_EXTENSION_TEMPLATES = Object.freeze([
     id: "cursor",
     displayName: "Cursor Agent",
     protocol: "acp",
+    driverKind: "generic-acp",
     command: "cursor-agent",
     args: Object.freeze(["acp"]),
     argsTemplate: "acp",
+    envPolicy: "inherit",
+    credentialEnvKeys: Object.freeze([]),
+    ephemeralSupport: "delete",
     description: "Cursor CLI / Background Agent（ACP 协议模式）",
     installHint: "cursor-agent install",
-    homeSubdir: ".cursor",
     defaultModels: Object.freeze([
       Object.freeze({ slug: "cursor/auto", name: "Cursor Auto", isDefault: true }),
     ]),
@@ -325,12 +383,15 @@ export const BUILTIN_EXTENSION_TEMPLATES = Object.freeze([
     id: "grok",
     displayName: "Grok CLI",
     protocol: "acp",
+    driverKind: "generic-acp",
     command: "grok",
     args: Object.freeze(["acp"]),
     argsTemplate: "acp",
+    envPolicy: "inherit",
+    credentialEnvKeys: Object.freeze(["XAI_API_KEY"]),
+    ephemeralSupport: "delete",
     description: "xAI Grok 编程智能体 CLI（ACP 协议模式）",
     installHint: "grok-cli",
-    homeSubdir: ".grok",
     defaultModels: Object.freeze([
       Object.freeze({ slug: "grok-4", name: "Grok 4", isDefault: true }),
       Object.freeze({ slug: "grok-code-fast-1", name: "Grok Code Fast" }),
@@ -340,12 +401,15 @@ export const BUILTIN_EXTENSION_TEMPLATES = Object.freeze([
     id: "kiro",
     displayName: "Kiro CLI",
     protocol: "acp",
+    driverKind: "generic-acp",
     command: "kiro-cli",
     args: Object.freeze(["acp"]),
     argsTemplate: "acp",
+    envPolicy: "inherit",
+    credentialEnvKeys: Object.freeze([]),
+    ephemeralSupport: "delete",
     description: "AWS Kiro Spec-Driven Agent CLI（ACP 协议模式）",
     installHint: "kiro-cli",
-    homeSubdir: ".kiro",
     defaultModels: Object.freeze([
       Object.freeze({ slug: "kiro/default", name: "Kiro Default", isDefault: true }),
     ]),
@@ -354,12 +418,15 @@ export const BUILTIN_EXTENSION_TEMPLATES = Object.freeze([
     id: "goose",
     displayName: "Goose Agent",
     protocol: "acp",
+    driverKind: "generic-acp",
     command: "goose",
     args: Object.freeze(["acp"]),
     argsTemplate: "acp",
+    envPolicy: "inherit",
+    credentialEnvKeys: Object.freeze([]),
+    ephemeralSupport: "delete",
     description: "Block Goose 开源可扩展工程 Agent（ACP 协议模式）",
     installHint: "pipx install goose-ai",
-    homeSubdir: ".config/goose",
     defaultModels: Object.freeze([
       Object.freeze({ slug: "goose/default", name: "Goose Default", isDefault: true }),
     ]),
@@ -368,18 +435,102 @@ export const BUILTIN_EXTENSION_TEMPLATES = Object.freeze([
     id: "aider",
     displayName: "Aider CLI",
     protocol: "cli",
+    driverKind: "generic-cli",
     command: "aider",
     args: Object.freeze(["--model", "{{model}}", "--yes-always", "--no-pretty", "--message", "{{prompt}}"]),
     argsTemplate: "--model {{model}} --yes-always --no-pretty --message {{prompt}}",
+    envPolicy: "inherit",
+    credentialEnvKeys: Object.freeze(["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "DEEPSEEK_API_KEY"]),
+    ephemeralSupport: "close-only",
     description: "经典 Git AI 结对编程命令行（通用 CLI 模板模式）",
     installHint: "pipx install aider-chat",
-    homeSubdir: ".aider",
     defaultModels: Object.freeze([
       Object.freeze({ slug: "deepseek/deepseek-coder", name: "DeepSeek Coder", isDefault: true }),
       Object.freeze({ slug: "gpt-4.1", name: "GPT-4.1" }),
     ]),
   }),
 ]);
+
+function findBuiltinExtensionTemplate(rawId) {
+  const key = String(rawId || "").trim().toLowerCase();
+  if (!key) return null;
+  const canonical = normalizeProviderId(key).toLowerCase();
+  return BUILTIN_EXTENSION_TEMPLATES.find(
+    (t) => t.id === canonical || t.id === key || (Array.isArray(t.aliases) && (t.aliases.includes(key) || t.aliases.includes(canonical)))
+  ) || null;
+}
+
+export function getExtensionCandidatePaths(providerId, extraPaths = []) {
+  const id = normalizeProviderId(providerId).toLowerCase();
+  const home = os.homedir();
+  const list = Array.isArray(extraPaths) ? extraPaths.filter((p) => typeof p === "string" && p.trim()) : [];
+  if (id === "zcode") {
+    if (process.platform === "win32") {
+      const localAppData = process.env.LOCALAPPDATA || path.join(home, "AppData", "Local");
+      const programFiles = process.env.PROGRAMFILES || "C:\\Program Files";
+      list.push(
+        path.join(localAppData, "Programs", "ZCode", "resources", "glm", "zcode.cjs"),
+        path.join(programFiles, "ZCode", "resources", "glm", "zcode.cjs")
+      );
+    } else if (process.platform === "darwin") {
+      list.push(
+        "/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs",
+        path.join(home, "Applications", "ZCode.app", "Contents", "Resources", "glm", "zcode.cjs")
+      );
+    } else {
+      list.push(
+        "/opt/ZCode/resources/glm/zcode.cjs",
+        "/usr/lib/zcode/resources/glm/zcode.cjs",
+        "/usr/share/zcode/resources/glm/zcode.cjs"
+      );
+    }
+  } else if (id === "dsh") {
+    const appData = process.env.APPDATA || path.join(home, "AppData", "Roaming");
+    if (process.platform === "win32") {
+      list.push(path.join(appData, "npm", "node_modules", "@deepseek-ai", "dsh", "lib", "bin.js"));
+    }
+    if (process.env.npm_config_prefix) {
+      list.push(
+        process.platform === "win32"
+          ? path.join(process.env.npm_config_prefix, "node_modules", "@deepseek-ai", "dsh", "lib", "bin.js")
+          : path.join(process.env.npm_config_prefix, "lib", "node_modules", "@deepseek-ai", "dsh", "lib", "bin.js")
+      );
+    }
+    if (process.platform !== "win32") {
+      list.push(
+        path.join(home, ".npm-global", "lib", "node_modules", "@deepseek-ai", "dsh", "lib", "bin.js"),
+        "/opt/homebrew/lib/node_modules/@deepseek-ai/dsh/lib/bin.js",
+        "/usr/local/lib/node_modules/@deepseek-ai/dsh/lib/bin.js"
+      );
+    }
+  }
+  return [...new Set(list)];
+}
+
+export function maskHomePrefix(filePath) {
+  if (!filePath || typeof filePath !== "string") return null;
+  const home = os.homedir();
+  if (!home) return filePath;
+  const normFile = path.resolve(filePath);
+  const normHome = path.resolve(home);
+  const cmpFile = process.platform === "win32" ? normFile.toLowerCase() : normFile;
+  const cmpHome = process.platform === "win32" ? normHome.toLowerCase() : normHome;
+  if (cmpFile === cmpHome) return "~";
+  if (cmpFile.startsWith(cmpHome + path.sep)) {
+    return `~${normFile.slice(normHome.length)}`;
+  }
+  return normFile;
+}
+
+export function detectExtensionBinary(providerId, command, candidates, protocol) {
+  try {
+    if (protocol === "zcode" || (providerId === "dsh" && protocol === "acp")) {
+      const bin = protocol === "zcode" ? resolveZCodeBinary(candidates, command, true) : resolveDshBinary(candidates, command);
+      return { detected: bin.available, binaryPath: bin.resolvedPath };
+    }
+    return detectCommandOnSystem(command, candidates);
+  } catch { return { detected: false, binaryPath: null }; }
+}
 
 /**
  * Normalize customProviders input (Array or Object map) into an Array of configs.
@@ -403,41 +554,89 @@ export function normalizeCustomProvidersList(customProviders) {
  */
 export function sanitizeExtensionProviderConfig(cfg = {}) {
   const id = String(cfg.id || cfg.provider || "").trim();
+  const tpl = findBuiltinExtensionTemplate(id);
   const envObj = cfg.env && typeof cfg.env === "object" ? cfg.env : {};
   const envKeys = Array.isArray(cfg.envKeys)
     ? cfg.envKeys.map(String)
     : Object.keys(envObj);
 
-  const protocol = String(cfg.protocol || "acp").toLowerCase() === "cli" ? "cli" : "acp";
+  const rawProto = String(
+    cfg.protocol ||
+      (cfg.driverKind === "zcode" ? "zcode" : cfg.driverKind === "generic-cli" ? "cli" : tpl?.protocol || "acp")
+  ).trim().toLowerCase();
+  const protocol = rawProto === "zcode" ? "zcode" : rawProto === "cli" ? "cli" : "acp";
+  const driverKind = protocol === "zcode" ? "zcode" : protocol === "cli" ? "generic-cli" : "generic-acp";
   const args = Array.isArray(cfg.args)
     ? cfg.args.map(String)
     : typeof cfg.args === "string" && cfg.args.trim()
       ? cfg.args.trim().split(/\s+/)
-      : protocol === "acp"
-        ? ["acp"]
-        : ["{{prompt}}"];
+      : Array.isArray(tpl?.args) && tpl.protocol === protocol
+        ? [...tpl.args]
+        : protocol === "zcode"
+          ? ["app-server", "--stdio"]
+          : protocol === "acp"
+            ? ["acp"]
+            : ["{{prompt}}"];
+
+  const rawEnvPolicy = String(cfg.envPolicy || "").trim().toLowerCase();
+  const envPolicy = rawEnvPolicy === "minimal" || rawEnvPolicy === "inherit"
+    ? rawEnvPolicy
+    : tpl?.envPolicy || "inherit";
+  const credentialEnvKeys = Array.isArray(cfg.credentialEnvKeys)
+    ? cfg.credentialEnvKeys.map(String).filter(Boolean)
+    : Array.isArray(tpl?.credentialEnvKeys)
+      ? [...tpl.credentialEnvKeys]
+      : [];
+  const ephemeralSupport = protocol !== "acp" ? "close-only" : cfg.ephemeralSupport === "close-only" || cfg.ephemeralSupport === "delete"
+    ? cfg.ephemeralSupport
+    : tpl?.ephemeralSupport || "delete";
+  const defaultEfforts = Array.isArray(tpl?.efforts) && tpl.efforts.length > 0 ? [...tpl.efforts] : ["low", "medium", "high"];
+  const preferred = cfg.models?.find?.(m => m?.isDefault) ?? cfg.models?.[0];
+  const defaultModel = String(cfg.defaultModel || (typeof preferred === "string" ? preferred : preferred?.slug || preferred?.id || ""));
 
   return {
     id,
     provider: id,
-    displayName: String(cfg.displayName || cfg.name || id),
+    displayName: String(cfg.displayName || cfg.name || tpl?.displayName || id),
     protocol,
-    command: String(cfg.command || id).trim(),
+    driverKind,
+    command: String(cfg.command || tpl?.command || id).trim(),
     args,
     argsTemplate: typeof cfg.argsTemplate === "string" ? cfg.argsTemplate : args.join(" "),
+    envPolicy,
+    credentialEnvKeys,
+    ...(Array.isArray(cfg.extraCandidatePaths) ? { extraCandidatePaths: cfg.extraCandidatePaths.filter(p => typeof p === "string" && p.trim()) } : {}),
+    ephemeralSupport,
     enabled: cfg.enabled !== false,
     isExtension: true,
-    defaultModel: String(cfg.defaultModel || cfg.models?.[0]?.slug || cfg.models?.[0]?.id || ""),
-    efforts: Array.isArray(cfg.efforts) && cfg.efforts.length > 0 ? cfg.efforts.map(String) : ["low", "medium", "high"],
+    defaultModel,
+    efforts: Array.isArray(cfg.efforts) && cfg.efforts.length > 0 ? cfg.efforts.map(String) : defaultEfforts,
     modes: Array.isArray(cfg.modes) && cfg.modes.length > 0 ? cfg.modes.map(String) : ["default", "plan", "auto"],
     models: Array.isArray(cfg.models)
       ? cfg.models.map((m, idx) => {
-          const slug = typeof m === "string" ? m : String(m.slug || m.id || m.value || `model_${idx + 1}`);
+          if (typeof m === "string") {
+            return { id: m, slug: m, name: m, contextWindow: 0, isDefault: m === defaultModel };
+          }
+          const slug = String(m.slug || m.id || m.value || `model_${idx + 1}`);
+          const group = typeof m.group === "string" && m.group.trim() ? m.group.trim() : "";
+          const description = typeof m.description === "string" && m.description.trim() ? m.description.trim() : "";
+          const contextWindow = normalizeTokenLimit(m.contextWindow ?? m.maxContextTokens);
+          const maxOutputTokens = normalizeTokenLimit(m.maxOutputTokens);
+          const modelEfforts = Array.isArray(m.efforts)
+            ? m.efforts.map((e) => String(e || "").trim()).filter(Boolean)
+            : undefined;
+          const modelDefaultEffort = typeof m.defaultEffort === "string" && m.defaultEffort.trim() ? m.defaultEffort.trim() : "";
           return {
             id: slug,
             slug,
-            name: typeof m === "string" ? m : String(m.name || m.label || slug),
-            isDefault: Boolean(typeof m === "object" && m.isDefault) || idx === 0,
+            name: String(m.name || m.label || slug),
+            ...(group ? { group } : {}),
+            ...(description ? { description } : {}),
+            contextWindow,
+            ...(maxOutputTokens > 0 ? { maxOutputTokens } : {}),
+            ...(modelEfforts ? { efforts: modelEfforts } : {}),
+            ...(modelDefaultEffort ? { defaultEffort: modelDefaultEffort } : {}),
+            isDefault: slug === defaultModel,
           };
         })
       : [],
@@ -447,34 +646,40 @@ export function sanitizeExtensionProviderConfig(cfg = {}) {
 }
 
 /**
- * Inspect all 7 built-in extension templates with live local binary & directory auto-detection.
+ * Inspect all built-in extension templates with binary-only local auto-detection (Zero Dotfile Touch).
  */
 export function listExtensionTemplates({ customProviders = [] } = {}) {
-  const home = os.homedir();
   const savedMap = new Map(
-    normalizeCustomProvidersList(customProviders).map((c) => [String(c.id || c.provider).toLowerCase(), c])
+    normalizeCustomProvidersList(customProviders).map((c) => [normalizeProviderId(String(c.id || c.provider)).toLowerCase(), c])
   );
 
   return BUILTIN_EXTENSION_TEMPLATES.map((tpl) => {
-    const binCheck = detectCommandOnSystem(tpl.command);
-    const homeDirPath = tpl.homeSubdir ? path.join(home, tpl.homeSubdir) : null;
-    const directoryDetected = Boolean(homeDirPath && existsSync(homeDirPath));
     const saved = savedMap.get(tpl.id.toLowerCase());
+    const { protocol, driverKind } = sanitizeExtensionProviderConfig(saved || tpl);
+    const candidates = getExtensionCandidatePaths(tpl.id, saved?.extraCandidatePaths);
+    const binCheck = detectExtensionBinary(tpl.id, saved?.command || tpl.command, candidates, protocol);
+    const savedPolicy = String(saved?.envPolicy || "").trim().toLowerCase();
+    const envPolicy = savedPolicy === "minimal" || savedPolicy === "inherit" ? savedPolicy : tpl.envPolicy || "inherit";
 
     return {
       id: tpl.id,
       displayName: tpl.displayName,
-      protocol: tpl.protocol,
+      protocol,
+      driverKind,
       command: saved?.command || tpl.command,
-      args: saved?.args || [...tpl.args],
+      args: Array.isArray(saved?.args) ? [...saved.args] : [...tpl.args],
       argsTemplate: saved?.argsTemplate || tpl.argsTemplate,
+      envPolicy,
+      credentialEnvKeys: [...(tpl.credentialEnvKeys || [])],
+      ephemeralSupport: saved?.ephemeralSupport || tpl.ephemeralSupport || "delete",
+      efforts: Array.isArray(saved?.efforts) && saved.efforts.length ? [...saved.efforts] : [...(tpl.efforts || ["low", "medium", "high"])],
       description: tpl.description,
       installHint: tpl.installHint,
-      detected: Boolean(binCheck.detected || directoryDetected),
+      detected: Boolean(binCheck.detected),
       binaryDetected: Boolean(binCheck.detected),
-      binaryPath: binCheck.binaryPath || null,
-      directoryDetected,
-      directoryPath: directoryDetected ? homeDirPath : null,
+      binaryPath: maskHomePrefix(binCheck.binaryPath),
+      directoryDetected: false,
+      directoryPath: null,
       configured: Boolean(saved),
       enabled: saved ? saved.enabled !== false : false,
       defaultModels: tpl.defaultModels.map((m) => ({ ...m })),
@@ -503,6 +708,8 @@ export function normalizeProviderId(id) {
     return "kimi-code";
   }
   if (lower === "qwen" || lower === "qwen-code") return "qwen-code";
+  if (lower === "dsh" || lower === "deepseek-harness") return "dsh";
+  if (lower === "zcode" || lower === "z-code" || lower === "zai-zcode") return "zcode";
   if (lower === "codex" || lower === "openai" || lower === "openai-codex") {
     return "codex";
   }
@@ -1242,8 +1449,8 @@ export async function loadProviderCatalogs({
     if (!clean.id || coreIds.has(normalizeProviderId(clean.id))) continue;
     if (!clean.enabled) continue;
 
-    const tplMatch = BUILTIN_EXTENSION_TEMPLATES.find((t) => t.id === clean.id);
-    const binDetect = detectCommandOnSystem(clean.command);
+    const tplMatch = findBuiltinExtensionTemplate(clean.id);
+    const binDetect = detectExtensionBinary(normalizeProviderId(clean.id), clean.command, getExtensionCandidatePaths(clean.id, clean.extraCandidatePaths), clean.protocol);
     const rawModels =
       clean.models.length > 0
         ? clean.models
@@ -1252,63 +1459,84 @@ export async function loadProviderCatalogs({
           : [{ slug: clean.defaultModel || `${clean.id}/default`, name: `${clean.displayName} Default`, isDefault: true }];
 
     const extEfforts = clean.efforts || ["low", "medium", "high"];
-    const extOptionDescriptors = [
+    const extDefaultEffort = extEfforts[Math.floor(extEfforts.length / 2)] || "high";
+    const buildExtOptionDescriptors = (effortsList, currentVal) => [
       {
         id: "thinking",
         label: "Thinking",
         type: "select",
         role: "reasoning",
-        currentValue: extEfforts[Math.floor(extEfforts.length / 2)] || "high",
-        options: extEfforts.map((e) => ({ id: e, label: e })),
+        currentValue: currentVal,
+        options: effortsList.map((e) => ({ id: e, label: e })),
       },
     ];
+    const extOptionDescriptors = buildExtOptionDescriptors(extEfforts, extDefaultEffort);
 
     const projectedModels = rawModels.map((m, idx) => {
       const slug = String(m.slug || m.id || `${clean.id}/default`);
+      const contextWindow = normalizeTokenLimit(m.contextWindow ?? m.maxContextTokens);
+      const maxOutputTokens = normalizeTokenLimit(m.maxOutputTokens);
+      const effectiveEfforts = m.efforts ?? extEfforts;
+      const modelDefaultEffort =
+        typeof m.defaultEffort === "string" && m.defaultEffort.trim() && effectiveEfforts.includes(m.defaultEffort.trim())
+          ? m.defaultEffort.trim()
+          : effectiveEfforts[Math.floor(effectiveEfforts.length / 2)] || "";
+      const optionDescriptors =
+        effectiveEfforts === extEfforts && modelDefaultEffort === extDefaultEffort
+          ? extOptionDescriptors
+          : effectiveEfforts.length ? buildExtOptionDescriptors(effectiveEfforts, modelDefaultEffort) : [];
       return {
         id: slug,
         slug,
         name: String(m.name || slug),
+        ...(m.group ? { group: String(m.group) } : {}),
+        ...(m.description ? { description: String(m.description) } : {}),
         provider: clean.id,
-        isDefault: Boolean(m.isDefault) || idx === 0,
+        isDefault: clean.defaultModel ? slug === clean.defaultModel : Boolean(m.isDefault) || idx === 0,
         isCustom: true,
         isLegacy: false,
         enabled: true,
         locked: false,
-        effortOptionId: "thinking",
-        efforts: extEfforts,
-        defaultEffort: extEfforts[Math.floor(extEfforts.length / 2)] || "high",
+        effortOptionId: effectiveEfforts.length ? "thinking" : undefined,
+        efforts: effectiveEfforts,
+        defaultEffort: modelDefaultEffort,
         modes: clean.modes,
-        contextWindow: 262144,
-        optionDescriptors: extOptionDescriptors,
-        capabilities: { optionDescriptors: extOptionDescriptors },
+        contextWindow,
+        ...(maxOutputTokens > 0 ? { maxOutputTokens } : {}),
+        optionDescriptors,
+        capabilities: { optionDescriptors },
       };
     });
 
     extensionProviders.push({
       id: clean.id,
       provider: clean.id,
-      driver: clean.protocol === "cli" ? "generic-cli" : "generic-acp",
+      driver: clean.driverKind || (clean.protocol === "zcode" ? "zcode" : clean.protocol === "cli" ? "generic-cli" : "generic-acp"),
+      driverKind: clean.driverKind,
       protocol: clean.protocol,
       isExtension: true,
       displayName: clean.displayName,
       version: binDetect.detected ? "installed" : "custom",
-      status: "ready",
+      status: binDetect.detected ? "ready" : "not_installed",
       installed: binDetect.detected,
-      binaryPath: binDetect.binaryPath,
+      binaryPath: maskHomePrefix(binDetect.binaryPath),
       command: clean.command,
       args: clean.args,
       argsTemplate: clean.argsTemplate,
+      envPolicy: clean.envPolicy,
+      credentialEnvKeys: clean.credentialEnvKeys,
+      ephemeralSupport: clean.ephemeralSupport,
       envKeys: clean.envKeys,
       enabled: true,
-      authenticated: true,
+      authenticated: Boolean(binDetect.detected && rawExt.authenticated === true),
       locked: false,
       supportedPermissionModes: PROVIDER_PERMISSION_MODES.generic.map((m) => m.value),
       permissionModes: listPermissionModesForProvider(clean.id),
       supportedInteractionModes: ["default", "plan"],
       nativeModes: clean.modes,
+      configDefaultModel: clean.defaultModel || projectedModels.find(m => m.isDefault)?.slug,
       supportsLiveSteer: false,
-      supportsSessionResume: clean.protocol === "acp",
+      supportsSessionResume: clean.protocol === "acp" || clean.protocol === "zcode",
       models: projectedModels,
     });
   }
@@ -1356,12 +1584,14 @@ export function normalizeEffortForTarget(provider, model, rawEffort, allowedEffo
   const valid = allowedEfforts ?? getCatalogEfforts(latestCatalog, p, model) ??
     builtinEfforts[p]?.find((m) => m.slug === model?.toLowerCase())?.efforts ??
     (p === "antigravity" ? ["low", "medium", "high"] : undefined);
-  if (p === "antigravity" && (isAgyOrchestratorModel(model) || isAgyCoarseSubagentModel(model) || valid?.length === 0)) return INHERIT_EFFORT;
+  if (valid?.length === 0 || p === "antigravity" && (isAgyOrchestratorModel(model) || isAgyCoarseSubagentModel(model))) return INHERIT_EFFORT;
   if (!valid?.length || valid.includes(rawEffort)) return rawEffort || "high";
   if (valid.includes(e)) return e;
-  const rank = (v) => EFFORT_SCALE.indexOf(({ none: "off", on: "high", normal: "medium" })[v] ?? v);
+  const rank = (v) => EFFORT_SCALE.indexOf(({ none: "off", disabled: "off", on: "high", enabled: "high", normal: "medium" })[v] ?? v);
   const target = rank(e);
   if (target >= 0) {
+    if (target === 0 && valid.includes("disabled")) return "disabled";
+    if (target > 0 && valid.includes("enabled") && valid.every((v) => v === "disabled" || v === "enabled")) return "enabled";
     const supported = valid.filter((v) => rank(v) >= 0);
     if (supported.length) return supported.reduce((best, v) => {
       const delta = Math.abs(rank(v) - target) - Math.abs(rank(best) - target);

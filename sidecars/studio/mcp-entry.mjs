@@ -642,7 +642,7 @@ export const MCP_TOOLS = Object.freeze([
   {
     name: 'manage_providers',
     description:
-      '开放平台扩展中心（Provider & ACP Extension Hub）管理工具：支持列出内置 7 大扩展平台预设（OpenCode / Gemini CLI / Cursor / Grok / Kiro / Goose / Aider）及本机探测状态（list_templates）、真机握手探测并自动拉取模型列表（probe）、保存/启用自定义 ACP 或 CLI 平台（save）、以及停用移除平台（remove）。',
+      '开放平台扩展中心（Provider & ACP Extension Hub）管理工具：支持列出内置主流扩展平台预设（OpenCode / DSH / ZCode / Gemini CLI / Qwen Code / Cursor / Grok / Kiro / Goose / Aider）及本机二进制探测状态（list_templates）、真机握手探测并自动拉取模型列表（probe）、保存/启用自定义 ACP、ZCode 或 CLI 平台（save）、以及停用移除平台（remove）。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -654,7 +654,7 @@ export const MCP_TOOLS = Object.freeze([
         },
         id: {
           type: 'string',
-          description: '扩展平台唯一标识 ID（如 "opencode"、"gemini-cli"、"cursor"、"grok"、"kiro"、"goose"、"aider" 或自定义 ID）。',
+          description: '扩展平台唯一标识 ID（如 "opencode"、"dsh"、"zcode"、"gemini-cli"、"qwen-code"、"cursor"、"grok"、"kiro"、"goose"、"aider" 或自定义 ID）。',
         },
         name: {
           type: 'string',
@@ -662,17 +662,22 @@ export const MCP_TOOLS = Object.freeze([
         },
         protocol: {
           type: 'string',
-          enum: ['acp', 'cli'],
-          description: '接入协议类型："acp" 为标准 JSON-RPC 2.0 over Stdio ACP 协议；"cli" 为命令行占位符模板模式。',
+          enum: ['acp', 'cli', 'zcode'],
+          description: '接入协议类型："acp" 为标准 JSON-RPC 2.0 over Stdio ACP 协议；"zcode" 为 ZCode 官方 app-server stdio 协议；"cli" 为命令行占位符模板模式。',
+        },
+        envPolicy: {
+          type: 'string',
+          enum: ['minimal', 'inherit'],
+          description: '子进程环境变量策略："minimal" 极简隔离（仅透传基础运行环境与本平台密钥），"inherit" 继承当前终端全部环境变量。',
         },
         command: {
           type: 'string',
-          description: '可执行文件名称或绝对路径（如 "opencode"、"gemini"、"aider"）。',
+          description: '可执行文件名称或绝对路径（如 "opencode"、"dsh"、"zcode"、"gemini"、"aider"）。',
         },
         args: {
           type: 'array',
           items: { type: 'string' },
-          description: 'ACP 启动参数数组（如 ["acp"] 或 ["--experimental-acp"]）。',
+          description: '启动参数数组（如 ["acp"]、["--profile", "acp"] 或 ["app-server", "--stdio"]）。',
         },
         argsTemplate: {
           type: 'array',
@@ -834,7 +839,19 @@ function formatMcpToolError(message) {
   };
 }
 
+const CHILD_RECURSIVE_BLOCKED_TOOLS = new Set([
+  'delegate_task',
+  'delegate_parallel_batch',
+  'thread_launch',
+  'thread_send',
+  'review_code',
+]);
+
 export async function executeMcpToolCall(toolName, rawArgs = {}) {
+  const dispatchesQueue = toolName === 'thread_queue' && ['enqueue', 'promote_to_steer'].includes(String(rawArgs?.action || '').trim().toLowerCase());
+  if (process.env.AGENT_TOWER_CHILD_PROCESS === '1' && (CHILD_RECURSIVE_BLOCKED_TOOLS.has(toolName) || dispatchesQueue)) {
+    return formatMcpToolError(`CHILD_RECURSIVE_DISPATCH_FORBIDDEN: 外部子进程禁止递归调用编排派发工具 (${toolName})`);
+  }
   const client = await getDaemonClientModule();
   const { ensureDaemon } = client;
   const daemonRpc = (method, params) => client.daemonRpc(method, { ...params, _agentTowerSurface: 'mcp' });
@@ -1056,6 +1073,7 @@ export async function executeMcpToolCall(toolName, rawArgs = {}) {
         const res = await daemonRpc('probeExtensionProvider', {
           id: args.id,
           protocol: args.protocol,
+          envPolicy: args.envPolicy,
           command: args.command,
           args: args.args,
           argsTemplate: args.argsTemplate,
@@ -1063,6 +1081,7 @@ export async function executeMcpToolCall(toolName, rawArgs = {}) {
           cwd: args.cwd,
           workspace: args.workspace,
           timeoutMs: args.timeoutMs,
+          force: args.force,
         });
         return formatMcpToolSuccess(res);
       }

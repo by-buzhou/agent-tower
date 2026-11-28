@@ -108,7 +108,8 @@ function getAvailableEffortsForSelection(prov, modelId) {
   if (!prov) return ['low', 'medium', 'high'];
   if (modelId === ROUTER_DEFAULT_MODEL) {
     const defMod = prov.configDefaultModel ? prov.models.find((m) => m.id === prov.configDefaultModel) : null;
-    return defMod?.efforts?.length ? defMod.efforts : ['low', 'medium', 'high', 'xhigh', 'max'];
+    if (Array.isArray(defMod?.efforts)) return defMod.efforts.length ? defMod.efforts : [INHERIT_EFFORT];
+    return ['low', 'medium', 'high', 'xhigh', 'max'];
   }
   const mod = prov.models.find((m) => m.id === modelId);
   if (Array.isArray(mod?.efforts)) return mod.efforts.length ? mod.efforts : [INHERIT_EFFORT];

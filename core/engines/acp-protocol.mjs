@@ -1,6 +1,6 @@
 import path from "node:path";
 import { PLUGIN_VERSION } from "../daemon-client.mjs";
-import { classifyEngineError, isMethodNotFoundError, isMissingSessionError, safeEngineError } from "./proc-utils.mjs";
+import { classifyEngineError, isEngineAuthenticationError, isMethodNotFoundError, isMissingSessionError, safeEngineError } from "./proc-utils.mjs";
 
 export async function initializeAcp(rpc, { elicitation = false, timeoutMs = 20000 } = {}) {
   const response = await rpc.request("initialize", {
@@ -32,21 +32,21 @@ function loginHint(method) {
 
 export function classifyAcpError(err, initialized, command) {
   const detail = safeEngineError(err);
-  if (Number(err?.rpcCode) === -32000 ||
+  if (["ACP_PROTOCOL_UNSUPPORTED", "ACP_MODEL_SWITCH_FAILED", "ACP_PLAN_MODE_UNSUPPORTED", "ACP_SESSION_RESUME_UNSUPPORTED"].includes(err?.code)) {
+    return { error: detail, code: err.code, category: "validation_error", isRetryable: false };
+  }
+  if (Number(err?.rpcCode) === -32000 || isEngineAuthenticationError(detail) ||
       /auth(?:entication)?[ _-]required|unauthenticated|not (?:logged in|authenticated|signed in)|requires authentication|authentication or authorization failed|(?:authentication|login|sign.in) (?:failed|required)|please (?:log|sign) in|\b401\b/i.test(detail)) {
     const methods = err?.rpcData?.authMethods ?? initialized?.authMethods;
     const hints = Array.isArray(methods) ? methods.map(loginHint).filter(Boolean) : [];
     const error = `ACP 引擎需要登录。请在终端完成认证后重试。 ${hints.join(" / ") || `打开 ${path.basename(String(command || "ACP"))} CLI，按提示登录。`}`;
     return { error, code: "ACP_AUTH_REQUIRED", category: "permission_error", isRetryable: false };
   }
-  if (["ACP_PROTOCOL_UNSUPPORTED", "ACP_SESSION_RESUME_UNSUPPORTED"].includes(err?.code)) {
-    return { error: detail, code: err.code, category: "validation_error", isRetryable: false };
-  }
   return { error: detail, ...classifyEngineError(err, err?.rpcCode) };
 }
 
 export async function resumeOrCreateAcpSession(rpc, {
-  nativeSessionId, cwd, capabilities, mcpServers = [], resumeTimeoutMs = 15000, newTimeoutMs = 15000,
+  nativeSessionId, cwd, capabilities, mcpServers = [], resumeTimeoutMs = 15000, newTimeoutMs = 15000, allowNewSessionFallback = false,
 } = {}) {
   const params = { cwd, mcpServers: Array.isArray(mcpServers) ? mcpServers : [] };
   if (nativeSessionId) {
@@ -54,20 +54,22 @@ export async function resumeOrCreateAcpSession(rpc, {
     if (capabilities?.sessionCapabilities?.resume) methods.push("session/resume");
     if (capabilities?.loadSession === true) methods.push("session/load");
     let missing = false;
-    let unsupported;
     for (const method of methods) {
       try {
         const sessionData = await rpc.request(method, { ...params, sessionId: nativeSessionId }, resumeTimeoutMs);
         return { sessionId: nativeSessionId, sessionData: sessionData || {}, resumed: true };
       } catch (err) {
         if (Number(err?.rpcCode) === -32000) throw err;
-        if (isMethodNotFoundError(err)) { unsupported = err; continue; }
-        if (isMissingSessionError(err)) { missing = true; break; }
+        if (isMethodNotFoundError(err)) continue;
+        if (isMissingSessionError(err)) {
+          missing = true;
+          break;
+        }
         throw err;
       }
     }
-    if (!missing) {
-      throw Object.assign(new Error("ACP 引擎未提供可用的会话恢复能力。", { cause: unsupported }), {
+    if (!missing && !allowNewSessionFallback) {
+      throw Object.assign(new Error("该 ACP 引擎未声明会话恢复能力，无法续接指定会话。"), {
         code: "ACP_SESSION_RESUME_UNSUPPORTED",
       });
     }

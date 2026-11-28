@@ -8,7 +8,7 @@ import { setText } from './dom-guards.js';
 import { EMPTY_MEMBER_FALLBACK, PRESET_ROUTE_FIELDS, activeGroupMembers, currentOrchestrationMode, fallbackGroupPreset, getEffectiveCwd, isModeStageEnabled, isPresetInActivePool, listDispatchablePresets, preferredGroupPreset, recomputeScopedStats, state } from './state.js';
 import { scheduleRender } from './render.js';
 import { describeRpcError, relayToHostConversation, rpcCall, showToast } from './net.js';
-import { normalizeProviderId, normalizeProvidersCatalog, normalizeThread, presetDispatchRoute } from './normalize.js';
+import { normalizeModelTokenLimit, normalizeProviderId, normalizeProvidersCatalog, normalizeThread, presetDispatchRoute } from './normalize.js';
 import { formatEffortDisplay, formatModelDisplay, formatProviderBadge, getRoleIcon } from './widgets.js';
 import { buildEffortOptionsHtml, buildModelOptionsHtml, buildPermissionOptionsHtml, buildProviderOptionsHtml, populateLinkedSelectTrio, syncComposerSelects } from './options.js';
 import { ensureDispatchAllowedInteractive, refreshThreadsList } from './stream.js';
@@ -437,12 +437,48 @@ export function triggerAstraCodeReview(customCwd = '', labelSuffix = '当前项�
   openCodeReviewModal(customCwd, labelSuffix, parentThreadIdOverride);
 }
 
+function normalizeWizardExtProtocol(rawProto, driverKind) {
+  const p = String(rawProto || '').trim().toLowerCase();
+  if (p === 'zcode' || p === 'cli' || p === 'acp') return p;
+  if (driverKind === 'zcode') return 'zcode';
+  if (driverKind === 'generic-cli') return 'cli';
+  return 'acp';
+}
+
+function wizardExtDriverKind(protocol) {
+  if (protocol === 'zcode') return 'zcode';
+  if (protocol === 'cli') return 'generic-cli';
+  return 'generic-acp';
+}
+
+function cacheWizardModelMeta(wizard, id, models, defaultModel) {
+  wizard.id = id;
+  wizard.defaultModel = defaultModel || '';
+  wizard.models.clear();
+  for (const m of Array.isArray(models) ? models : []) {
+    if (!m || typeof m !== 'object') continue;
+    const mid = String(m.id || m.slug || m.value || '').trim();
+    if (!mid) continue;
+    const maxOut = normalizeModelTokenLimit(m.maxOutputTokens);
+    wizard.models.set(mid, {
+      ...(m.group ? { group: String(m.group) } : {}),
+      ...(m.description ? { description: String(m.description) } : {}),
+      contextWindow: normalizeModelTokenLimit(m.contextWindow ?? m.maxContextTokens),
+      ...(maxOut ? { maxOutputTokens: maxOut } : {}),
+      ...(Array.isArray(m.efforts) ? { efforts: m.efforts.map(String) } : {}),
+      ...(m.defaultEffort ? { defaultEffort: String(m.defaultEffort) } : {}),
+      ...(m.isDefault !== undefined ? { isDefault: Boolean(m.isDefault) } : {}),
+    });
+  }
+}
+
 export function openExtensionWizard(extId = '') {
   const backdrop = document.getElementById('ext-modal-backdrop');
   const titleEl = document.getElementById('ext-modal-title');
   const idEl = document.getElementById('ext-id');
   const nameEl = document.getElementById('ext-name');
   const protoEl = document.getElementById('ext-protocol');
+  const envPolicyEl = document.getElementById('ext-env-policy');
   const enabledEl = document.getElementById('ext-enabled');
   const cmdEl = document.getElementById('ext-command');
   const argsEl = document.getElementById('ext-args');
@@ -453,7 +489,24 @@ export function openExtensionWizard(extId = '') {
   const removeBtn = document.getElementById('btn-ext-remove');
   if (!backdrop) return;
 
+  if (protoEl && !protoEl.dataset.atProtoBound) {
+    protoEl.dataset.atProtoBound = '1';
+    protoEl.addEventListener('change', () => {
+      const argsInput = document.getElementById('ext-args');
+      if (!argsInput) return;
+      const val = String(argsInput.value || '').trim();
+      if (protoEl.value === 'zcode' && (!val || val === 'acp')) {
+        argsInput.value = 'app-server --stdio';
+      } else if (protoEl.value === 'acp' && (!val || val === 'app-server --stdio')) {
+        argsInput.value = 'acp';
+      }
+    });
+  }
+
   state.editingExtId = extId || '';
+  const wizard = state.extensionWizard = { id: extId, models: new Map(), defaultModel: '' };
+  const probeBtn = document.getElementById('btn-ext-probe');
+  if (probeBtn) probeBtn.disabled = false;
   if (probeBox) {
     probeBox.hidden = true;
     probeBox.textContent = '';
@@ -470,25 +523,31 @@ export function openExtensionWizard(extId = '') {
       idEl.readOnly = Boolean(custom || tpl);
     }
     if (nameEl) nameEl.value = src.name || src.id;
-    if (protoEl) protoEl.value = src.protocol === 'cli' ? 'cli' : 'acp';
+    if (protoEl) protoEl.value = normalizeWizardExtProtocol(src.protocol, src.driverKind);
+    if (envPolicyEl) envPolicyEl.value = src.envPolicy === 'minimal' ? 'minimal' : 'inherit';
     if (enabledEl) enabledEl.checked = custom ? custom.enabled !== false : true;
     if (cmdEl) cmdEl.value = src.command || src.id;
     if (argsEl) argsEl.value = src.argsTemplate || (Array.isArray(src.args) ? src.args.join(' ') : '');
     const mList = src.models || src.defaultModels || [];
+    cacheWizardModelMeta(wizard, extId, mList, src.defaultModel);
     if (modelsEl) {
-      modelsEl.value = mList.map((m) => (m.name && m.name !== m.id ? `${m.id} | ${m.name}` : m.id)).join('\n');
+      modelsEl.value = mList.map(m => {
+        const id = m.id || m.slug;
+        return m.name && m.name !== id ? `${id} | ${m.name}` : id;
+      }).join('\n');
     }
     if (effortsEl) effortsEl.value = (src.efforts || ['low', 'medium', 'high']).join(', ');
     if (envEl) envEl.value = Array.isArray(src.envKeys) && src.envKeys.length ? src.envKeys.map((k) => `${k}=`).join('\n') : '';
     if (removeBtn) removeBtn.hidden = !custom;
   } else {
-    if (titleEl) titleEl.textContent = '接入自定义 Agent 引擎（ACP / CLI）';
+    if (titleEl) titleEl.textContent = '接入自定义 Agent 引擎（ACP / ZCode / CLI）';
     if (idEl) {
       idEl.value = '';
       idEl.readOnly = false;
     }
     if (nameEl) nameEl.value = '';
     if (protoEl) protoEl.value = 'acp';
+    if (envPolicyEl) envPolicyEl.value = 'inherit';
     if (enabledEl) enabledEl.checked = true;
     if (cmdEl) cmdEl.value = '';
     if (argsEl) argsEl.value = 'acp';
@@ -502,8 +561,12 @@ export function openExtensionWizard(extId = '') {
 }
 
 export async function probeWizardExtension() {
-  const id = document.getElementById('ext-id')?.value.trim() || 'probe-agent';
-  const protocol = document.getElementById('ext-protocol')?.value || 'acp';
+  const idEl = document.getElementById('ext-id');
+  const id = idEl?.value.trim() || '';
+  const wizard = state.extensionWizard;
+  const isCurrent = () => state.extensionWizard === wizard && idEl?.value.trim() === id;
+  const protocol = normalizeWizardExtProtocol(document.getElementById('ext-protocol')?.value);
+  const envPolicy = document.getElementById('ext-env-policy')?.value === 'minimal' ? 'minimal' : 'inherit';
   const command = document.getElementById('ext-command')?.value.trim() || '';
   const argsRaw = document.getElementById('ext-args')?.value.trim() || '';
   const envObj = parseEnvInput(document.getElementById('ext-env')?.value || '');
@@ -524,17 +587,24 @@ export async function probeWizardExtension() {
 
   try {
     const res = await rpcCall('probeExtensionProvider', {
-      id,
+      id: id || 'probe-agent',
       protocol,
+      driverKind: wizardExtDriverKind(protocol),
+      envPolicy,
       command,
       args: parseArgsInput(argsRaw),
       argsTemplate: protocol === 'cli' ? argsRaw : undefined,
       env: envObj,
       cwd: getEffectiveCwd() || undefined,
+      force: true,
     });
 
+    if (!isCurrent()) return;
     const ok = res?.ok !== false && res?.reachable !== false && res?.available !== false && !res?.error;
     const models = Array.isArray(res?.models) ? res.models : [];
+    if (ok && models.length > 0) {
+      cacheWizardModelMeta(wizard, id, models, res?.defaultModel);
+    }
     if (models.length > 0 && modelsEl) {
       modelsEl.value = models
         .map((m) => {
@@ -553,16 +623,18 @@ export async function probeWizardExtension() {
       ? `${res.agentInfo.name} ${res.agentInfo.version || ''}`
       : res?.binaryPath || command;
     if (probeBox) {
+      if (ok) wizard.ephemeralSupport = { id, value: res.ephemeralSupport };
       probeBox.textContent = ok
         ? `✅ 握手探测成功！引擎: ${agentLabel}\n发现模型数: ${models.length}${models.length ? '（已自动填入下方模型列表）' : ''}`
         : `⚠️ 探测返回提示: ${res?.error || res?.message || '未检测到有效响应，请核对路径或参数'}`;
     }
     if (ok) showToast(`⚡ 握手成功，拉取到 ${models.length} 款模型`, 'success');
   } catch (err) {
+    if (!isCurrent()) return;
     if (probeBox) probeBox.textContent = `❌ 握手探测失败: ${err.message}`;
     showToast(describeRpcError(err), 'error');
   } finally {
-    if (probeBtn) probeBtn.disabled = false;
+    if (probeBtn && state.extensionWizard === wizard) probeBtn.disabled = false;
   }
 }
 
@@ -570,7 +642,8 @@ export async function saveWizardExtension() {
   const rawId = document.getElementById('ext-id')?.value.trim() || '';
   const id = rawId.replace(/[^a-zA-Z0-9._-]/g, '-').toLowerCase();
   const name = document.getElementById('ext-name')?.value.trim() || id;
-  const protocol = document.getElementById('ext-protocol')?.value || 'acp';
+  const protocol = normalizeWizardExtProtocol(document.getElementById('ext-protocol')?.value);
+  const envPolicy = document.getElementById('ext-env-policy')?.value === 'minimal' ? 'minimal' : 'inherit';
   const enabled = Boolean(document.getElementById('ext-enabled')?.checked);
   const command = document.getElementById('ext-command')?.value.trim() || '';
   const argsRaw = document.getElementById('ext-args')?.value.trim() || '';
@@ -579,7 +652,22 @@ export async function saveWizardExtension() {
     .map((s) => s.trim())
     .filter(Boolean);
   const effectiveEfforts = efforts.length > 0 ? efforts : ['low', 'medium', 'high'];
-  const models = parseModelsTextarea(document.getElementById('ext-models')?.value || '', effectiveEfforts);
+  const parsedModels = parseModelsTextarea(document.getElementById('ext-models')?.value || '', effectiveEfforts);
+  const wizard = state.extensionWizard;
+  const sameProvider = wizard?.id === rawId;
+  const models = parsedModels.map((m) => {
+    const meta = sameProvider && wizard.models.get(m.id);
+    if (!meta) return m;
+    return {
+      ...meta,
+      id: m.id,
+      name: m.name,
+      efforts: meta.efforts ?? m.efforts,
+    };
+  });
+  const defaultModel = sameProvider && models.some((m) => m.id === wizard.defaultModel)
+    ? wizard.defaultModel
+    : undefined;
   const env = parseEnvInput(document.getElementById('ext-env')?.value || '');
 
   if (!id || !command) {
@@ -588,25 +676,27 @@ export async function saveWizardExtension() {
   }
 
   try {
-    await rpcCall('saveExtensionProvider', {
+    const saved = await rpcCall('saveExtensionProvider', {
       id,
       name,
       displayName: name,
       protocol,
-      driverKind: protocol === 'cli' ? 'generic-cli' : 'generic-acp',
+      driverKind: wizardExtDriverKind(protocol),
+      envPolicy,
       command,
       args: parseArgsInput(argsRaw),
       argsTemplate: protocol === 'cli' ? argsRaw : undefined,
       models,
+      ...(defaultModel ? { defaultModel } : {}),
+      ...(wizard?.ephemeralSupport?.id === rawId ? { ephemeralSupport: wizard.ephemeralSupport.value } : {}),
       efforts: effectiveEfforts,
       env: Object.keys(env).length > 0 ? env : undefined,
       enabled,
     });
-    document.getElementById('ext-modal-backdrop').hidden = true;
+    if (state.extensionWizard === wizard) document.getElementById('ext-modal-backdrop').hidden = true;
     await refreshExtensionProviders(true);
-    const caps = await rpcCall('getCapabilities', { refresh: true }).catch(() => null);
-    if (caps?.providers) {
-      state.providers = normalizeProvidersCatalog(caps.providers, state.customProviders);
+    if (saved?.providers) {
+      state.providers = normalizeProvidersCatalog(saved.providers, state.customProviders);
     }
     syncComposerSelects();
     scheduleRender();

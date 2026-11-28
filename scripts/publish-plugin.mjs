@@ -264,7 +264,7 @@ export async function cutover(options = production, delayMs = 0) {
       "updates",
     ]);
     const garbage =
-      /^(state\.sqlite(?:-(?:shm|wal|journal))?|daemon\.log(?:\.1)?|active-native-curators\.json|worktrees|archive-legacy|.*\.tmp)$/i;
+      /^(state\.sqlite(?:-(?:shm|wal|journal))?|daemon\.log(?:\.1)?|active-native-curators\.json|worktrees|warm-cwd|archive-legacy|.*\.tmp)$/i;
     const assertNoUpdateInProgress = () => {
       if (fs.existsSync(child(control, "updates", "apply.lock"))) {
         throw Object.assign(new Error("System update in progress"), { code: "UPDATE_IN_PROGRESS" });
@@ -315,7 +315,7 @@ export async function cutover(options = production, delayMs = 0) {
       health.version !== staged.version ||
       health.studioProtocolRevision !== 1 ||
       health.shuttingDown ||
-      files.filter(name => name !== "agy-catalog-cache.json" && name !== "updates").join("|") !== "daemon-lease.json|global-settings.json"
+      files.filter(name => name !== "agy-catalog-cache.json" && name !== "updates" && name !== "warm-cwd").join("|") !== "daemon-lease.json|global-settings.json"
     )
       throw Error("New daemon verification failed");
     const result = {

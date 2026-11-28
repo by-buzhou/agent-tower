@@ -134,6 +134,8 @@ export function normalizeProviderId(rawId) {
   if (low === 'kimi' || low === 'kimi-cli' || low === 'kimi_code') return 'kimi-code';
   if (['claude-agent', 'claude_agent', 'claude', 'claude-code', 'claude_code', 'claudeagent', 'anthropic'].includes(low)) return 'claude-code';
   if (low === 'agy' || low === 'host' || low === 'antigravity-host') return 'antigravity';
+  if (low === 'dsh' || low === 'deepseek-harness') return 'dsh';
+  if (low === 'zcode' || low === 'z-code' || low === 'zai-zcode') return 'zcode';
   return s;
 }
 
@@ -165,10 +167,37 @@ export function presetDispatchRoute(key, selection, options = {}) {
     : { provider: selection.provider, model: selection.model };
 }
 
+function normalizeExtProtocol(rawProtocol, driverKind, fallback = 'acp') {
+  const p = String(rawProtocol || '').trim().toLowerCase();
+  if (p === 'zcode' || p === 'cli' || p === 'acp') return p;
+  if (driverKind === 'zcode') return 'zcode';
+  if (driverKind === 'generic-cli') return 'cli';
+  return fallback === 'zcode' || fallback === 'cli' ? fallback : 'acp';
+}
+
+function normalizeExtEnvPolicy(rawPolicy, fallback = 'inherit') {
+  const p = String(rawPolicy || '').trim().toLowerCase();
+  if (p === 'minimal' || p === 'inherit') return p;
+  return fallback === 'minimal' ? 'minimal' : 'inherit';
+}
+
+export function normalizeModelTokenLimit(value) {
+  const n = typeof value === 'string' ? Number(value) : value;
+  return Number.isSafeInteger(n) && n > 0 ? n : 0;
+}
+
 export function normalizeExtensionList(rawTemplates, rawCustom) {
   const tplMap = new Map();
   for (const b of BUILTIN_EXTENSION_TEMPLATES_UI) {
-    tplMap.set(b.id, { ...b, detected: false, binaryPath: '', enabled: false });
+    tplMap.set(b.id, {
+      ...b,
+      driverKind: b.driverKind || (b.protocol === 'zcode' ? 'zcode' : b.protocol === 'cli' ? 'generic-cli' : 'generic-acp'),
+      envPolicy: normalizeExtEnvPolicy(b.envPolicy, 'inherit'),
+      ephemeralSupport: b.ephemeralSupport || 'delete',
+      detected: false,
+      binaryPath: '',
+      enabled: false,
+    });
   }
 
   const incomingTpls = Array.isArray(rawTemplates)
@@ -181,15 +210,23 @@ export function normalizeExtensionList(rawTemplates, rawCustom) {
     const id = String(rt.id || rt.key || '').trim();
     if (!id) continue;
     const prev = tplMap.get(id) || {};
+    const protocol = normalizeExtProtocol(rt.protocol, rt.driverKind, prev.protocol || 'acp');
+    const driverKind = String(rt.driverKind || prev.driverKind || (protocol === 'zcode' ? 'zcode' : protocol === 'cli' ? 'generic-cli' : 'generic-acp'));
     tplMap.set(id, {
       ...prev,
       ...rt,
       id,
       name: rt.name || rt.displayName || prev.name || id,
-      protocol: rt.protocol || (rt.driverKind === 'generic-cli' ? 'cli' : prev.protocol || 'acp'),
+      protocol,
+      driverKind,
       command: rt.command || prev.command || id,
       args: Array.isArray(rt.args) ? rt.args : prev.args || [],
       argsTemplate: rt.argsTemplate || prev.argsTemplate || '',
+      envPolicy: normalizeExtEnvPolicy(rt.envPolicy, prev.envPolicy || 'inherit'),
+      credentialEnvKeys: Array.isArray(rt.credentialEnvKeys) ? rt.credentialEnvKeys : prev.credentialEnvKeys || [],
+      ephemeralSupport: rt.ephemeralSupport === 'close-only' || rt.ephemeralSupport === 'delete'
+        ? rt.ephemeralSupport
+        : prev.ephemeralSupport || 'delete',
       description: rt.description || prev.description || '外部编程 Agent 扩展通道',
       detected: Boolean(rt.detected ?? rt.installed ?? rt.available ?? prev.detected),
       binaryPath: String(rt.binaryPath || rt.resolvedCommand || prev.binaryPath || ''),
@@ -209,27 +246,47 @@ export function normalizeExtensionList(rawTemplates, rawCustom) {
     if (!rc || typeof rc !== 'object') continue;
     const id = String(rc.id || rc.providerId || '').trim();
     if (!id) continue;
+    const tplRef = tplMap.get(id);
+    const protocol = normalizeExtProtocol(rc.protocol, rc.driverKind, tplRef?.protocol || 'acp');
+    const driverKind = String(rc.driverKind || tplRef?.driverKind || (protocol === 'zcode' ? 'zcode' : protocol === 'cli' ? 'generic-cli' : 'generic-acp'));
+    const envPolicy = normalizeExtEnvPolicy(rc.envPolicy, tplRef?.envPolicy || 'inherit');
+    const ephemeralSupport = rc.ephemeralSupport === 'close-only' || rc.ephemeralSupport === 'delete'
+      ? rc.ephemeralSupport
+      : tplRef?.ephemeralSupport || 'delete';
     const normModels = (Array.isArray(rc.models) ? rc.models : []).map((m) => {
       if (typeof m === 'string') return { id: m, name: m };
       const mid = String(m.id || m.slug || m.value || 'default');
+      const maxOut = normalizeModelTokenLimit(m.maxOutputTokens);
       return {
         id: mid,
         name: m.name || m.displayName || mid,
-        efforts: Array.isArray(m.efforts) ? m.efforts : rc.efforts || ['low', 'medium', 'high'],
+        ...(m.group ? { group: String(m.group) } : {}),
+        ...(m.description ? { description: String(m.description) } : {}),
+        contextWindow: normalizeModelTokenLimit(m.contextWindow ?? m.maxContextTokens),
+        ...(maxOut ? { maxOutputTokens: maxOut } : {}),
+        efforts: Array.isArray(m.efforts) ? m.efforts : rc.efforts || tplRef?.efforts || ['low', 'medium', 'high'],
+        ...(m.defaultEffort ? { defaultEffort: String(m.defaultEffort) } : {}),
+        ...(m.isDefault !== undefined ? { isDefault: Boolean(m.isDefault) } : {}),
       };
     });
     const entry = {
       id,
-      name: rc.name || rc.displayName || tplMap.get(id)?.name || id,
-      protocol: rc.protocol || (rc.driverKind === 'generic-cli' ? 'cli' : 'acp'),
-      command: rc.command || tplMap.get(id)?.command || id,
-      args: Array.isArray(rc.args) ? rc.args : tplMap.get(id)?.args || [],
-      argsTemplate: rc.argsTemplate || '',
+      name: rc.name || rc.displayName || tplRef?.name || id,
+      protocol,
+      driverKind,
+      command: rc.command || tplRef?.command || id,
+      args: Array.isArray(rc.args) ? rc.args : tplRef?.args || [],
+      argsTemplate: rc.argsTemplate || tplRef?.argsTemplate || '',
+      envPolicy,
+      credentialEnvKeys: Array.isArray(rc.credentialEnvKeys) ? rc.credentialEnvKeys : tplRef?.credentialEnvKeys || [],
+      ephemeralSupport,
       enabled: rc.enabled !== false,
-      detected: Boolean(rc.detected ?? tplMap.get(id)?.detected ?? true),
-      binaryPath: String(rc.binaryPath || tplMap.get(id)?.binaryPath || ''),
-      models: normModels.length > 0 ? normModels : tplMap.get(id)?.defaultModels || [{ id: 'default', name: '默认模型' }],
-      efforts: Array.isArray(rc.efforts) && rc.efforts.length ? rc.efforts : ['low', 'medium', 'high'],
+      configured: true,
+      detected: Boolean(rc.detected ?? tplRef?.detected),
+      binaryPath: String(rc.binaryPath || tplRef?.binaryPath || ''),
+      ...(rc.defaultModel ? { defaultModel: String(rc.defaultModel) } : {}),
+      models: normModels.length > 0 ? normModels : tplRef?.defaultModels || [{ id: 'default', name: '默认模型' }],
+      efforts: Array.isArray(rc.efforts) && rc.efforts.length ? rc.efforts : tplRef?.efforts || ['low', 'medium', 'high'],
       envKeys: Array.isArray(rc.envKeys) ? rc.envKeys : rc.env && typeof rc.env === 'object' ? Object.keys(rc.env) : [],
     };
     customArr.push(entry);
@@ -237,9 +294,14 @@ export function normalizeExtensionList(rawTemplates, rawCustom) {
     if (tplMap.has(id)) {
       const t = tplMap.get(id);
       t.enabled = entry.enabled;
+      t.configured = true;
+      t.protocol = entry.protocol;
+      t.driverKind = entry.driverKind;
       t.command = entry.command;
       t.args = entry.args;
       t.argsTemplate = entry.argsTemplate;
+      t.envPolicy = entry.envPolicy;
+      t.ephemeralSupport = entry.ephemeralSupport;
       t.defaultModels = entry.models;
       t.efforts = entry.efforts;
       t.envKeys = entry.envKeys;
@@ -339,16 +401,22 @@ export function normalizeProvidersCatalog(rawProviders, customProviders = state.
         else if (mid.includes('hydrogen')) efforts = ['low', 'medium', 'high', 'xhigh'];
         else efforts = ['low', 'medium', 'high'];
       }
+      const rawCw = rm.contextWindow !== undefined ? rm.contextWindow : rm.maxContextTokens;
+      const contextWindow = targetP.isExtension && rawCw !== undefined
+        ? normalizeModelTokenLimit(rawCw)
+        : Number(rawCw || existing.contextWindow || 0);
+      const rawMaxOut = normalizeModelTokenLimit(rm.maxOutputTokens ?? existing.maxOutputTokens);
       targetP.modelsMap.set(mid, {
         ...existing,
         id: mid,
         name: rm.name || rm.displayName || existing.name || mid,
         group: rm.group || rm.providerGroup || (mid.includes('/') ? mid.split('/')[0] : existing.group || ''),
+        ...(rm.description || existing.description ? { description: String(rm.description || existing.description) } : {}),
         efforts: [...efforts],
-        defaultEffort: rm.defaultEffort || existing.defaultEffort || efforts[Math.min(1, efforts.length - 1)] || 'high',
-        contextWindow: Number(rm.contextWindow || rm.maxContextTokens || existing.contextWindow || 0),
+        defaultEffort: efforts.length ? rm.defaultEffort || existing.defaultEffort || efforts[Math.min(1, efforts.length - 1)] : '',
+        contextWindow,
+        ...(rawMaxOut ? { maxOutputTokens: rawMaxOut } : {}),
         isDefault: Boolean(rm.isDefault ?? existing.isDefault),
-
       });
     }
   }
@@ -359,7 +427,7 @@ export function normalizeProvidersCatalog(rawProviders, customProviders = state.
     if (!byProvider.has(pid)) {
       byProvider.set(pid, {
         id: pid,
-        name: `${ext.name || pid} (${ext.protocol === 'cli' ? 'CLI' : 'ACP'})`,
+        name: `${ext.name || pid} (${(ext.protocol || 'acp').toUpperCase()})`,
         available: true,
         isNativeHost: false,
         isExtension: true,
@@ -373,6 +441,7 @@ export function normalizeProvidersCatalog(rawProviders, customProviders = state.
       });
     }
     const pEntry = byProvider.get(pid);
+    if (!pEntry.configDefaultModel) pEntry.configDefaultModel = ext.defaultModel || '';
     pEntry.available = true;
     pEntry.isExtension = !['kimi-code', 'codex', 'antigravity', 'claude-code'].includes(pid);
     if (!pEntry.catalogSource) pEntry.catalogSource = 'extension';
@@ -382,13 +451,18 @@ export function normalizeProvidersCatalog(rawProviders, customProviders = state.
     for (const em of extModels) {
       const mid = String(em.id || em.slug || em || 'default');
       if (!pEntry.modelsMap.has(mid)) {
-        const effs = em.efforts || ext.efforts || ['low', 'medium', 'high'];
+        const effs = Array.isArray(em.efforts) ? em.efforts : ext.efforts || ['low', 'medium', 'high'];
+        const maxOut = normalizeModelTokenLimit(em.maxOutputTokens);
         pEntry.modelsMap.set(mid, {
           id: mid,
           name: em.name || mid,
-          efforts: effs,
-          defaultEffort: effs[Math.min(1, effs.length - 1)] || 'medium',
-
+          group: em.group || em.providerGroup || (mid.includes('/') ? mid.split('/')[0] : ''),
+          ...(em.description ? { description: String(em.description) } : {}),
+          efforts: [...effs],
+          defaultEffort: effs.length ? em.defaultEffort || effs[Math.min(1, effs.length - 1)] : '',
+          contextWindow: normalizeModelTokenLimit(em.contextWindow ?? em.maxContextTokens),
+          ...(maxOut ? { maxOutputTokens: maxOut } : {}),
+          isDefault: Boolean(em.isDefault),
         });
       }
     }

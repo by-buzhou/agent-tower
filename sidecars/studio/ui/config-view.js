@@ -7,7 +7,7 @@ import { isUserInteractingWithin, setText } from './dom-guards.js';
 import { CUSTOM_MODEL_PROMPT_VALUE, GLOBAL_SETTINGS_PANES, MEMBER_DRAFT_KEY, MEMBER_GROUPS, MEMBER_GROUP_IDS, MODE_PROFILE_GROUPS, MODE_PROFILE_IDS, MODE_PROFILE_LABELS, ORCHESTRATION_MODE_META, PRESET_FIELD_LABELS, PROJECT_SETTINGS_PANES, ROLE_SHORT_TITLES, SETTINGS_PANES, SETTINGS_SCOPES, SETTINGS_SCOPE_DEFAULT_PANE, SPEC_CURATION_CHANGE_LABELS, actionableSpecProposal, applySpecCurationPayload, currentOrchestrationMode, currentProjectConfig, currentProjectWorkspace, currentSpecCuration, getEffectiveConversationId, getEffectiveCwd, isCuratorBlockedProvider, isModeStageEnabled, isProjectSpecEnabled, isStatusActive, listPoolMembers, modeEnabledMembers, modeGroupProfile, modeProfileIssues, normalizeModeId, normalizeSpecArchive, orchestrationModeMeta, preferredCuratorMember, presetDisplayLabel, settingsPaneKey, settingsScopeOf, specCurationWorkspace, state } from './state.js';
 import { scheduleRender } from './render.js';
 import { armOrConfirm, copyPlainText, describeRpcError, relayToHostConversation, rpcCall, showToast } from './net.js';
-import { isSystemUpdateTransitionState, normalizeExtensionList, normalizeProviderId, normalizeProvidersCatalog } from './normalize.js';
+import { isSystemUpdateTransitionState, normalizeExtensionList, normalizeModelTokenLimit, normalizeProviderId, normalizeProvidersCatalog } from './normalize.js';
 import { SPEC_KIND_LABELS, SPEC_WARNING_LABELS, engClass, formatCtx, formatModelDisplay, formatSpecBytes, roleTitle } from './widgets.js';
 import { applyCuratorLocks, commitGlobalMemberDraft, commitMemberDraft, ensurePresetsSaved, isValidCustomPresetKey, markGlobalModeProfileDirty, markGlobalPresetDirty, markModeProfileDirty, markPresetDirty, mergeRemotePresets, newCustomPresetBase, queueGlobalPresetDelete, queuePresetDelete, roleForMemberGroup, suggestCustomPresetKey, syncCurrentProjectSpecFromGlobal, syncGlobalSavePillVisibility, syncSavePillVisibility } from './presets.js';
 import { presetOptions, presetTrigger, reconcileModelSelection, remapPermissionOnProviderChange, syncComposerSelects } from './options.js';
@@ -77,33 +77,130 @@ export function parseEnvInput(str) {
   return env;
 }
 
+function extDriverKindFor(protocol, fallback = '') {
+  if (fallback) return fallback;
+  if (protocol === 'zcode') return 'zcode';
+  if (protocol === 'cli') return 'generic-cli';
+  return 'generic-acp';
+}
+
+function normalizeProbedModels(rawModels, efforts) {
+  if (!Array.isArray(rawModels)) return [];
+  return rawModels
+    .map((m) => {
+      if (typeof m === 'string') return { id: m, name: m, efforts: [...efforts] };
+      const id = String(m?.id || m?.slug || m?.value || '').trim();
+      if (!id) return null;
+      const maxOut = normalizeModelTokenLimit(m.maxOutputTokens);
+      const modelEfforts = Array.isArray(m?.efforts) ? m.efforts.map(String) : [...efforts];
+      return {
+        id,
+        name: String(m?.name || m?.displayName || id),
+        ...(m.group ? { group: String(m.group) } : {}),
+        ...(m.description ? { description: String(m.description) } : {}),
+        contextWindow: normalizeModelTokenLimit(m.contextWindow ?? m.maxContextTokens),
+        ...(maxOut ? { maxOutputTokens: maxOut } : {}),
+        efforts: modelEfforts,
+        ...(m.defaultEffort ? { defaultEffort: String(m.defaultEffort) } : {}),
+        ...(m.isDefault !== undefined ? { isDefault: Boolean(m.isDefault) } : {}),
+      };
+    })
+    .filter(Boolean);
+}
+
 export async function quickEnableTemplateProvider(tplId) {
   const tpl = state.extensionTemplates.find((t) => t.id === tplId);
   if (!tpl) return;
+  const protocol = tpl.protocol === 'zcode' || tpl.protocol === 'cli' ? tpl.protocol : 'acp';
+  const driverKind = extDriverKindFor(protocol, tpl.driverKind);
+  const envPolicy = tpl.envPolicy === 'minimal' ? 'minimal' : 'inherit';
+  let efforts = Array.isArray(tpl.efforts) && tpl.efforts.length ? [...tpl.efforts] : ['low', 'medium', 'high'];
+  let models = tpl.defaultModels || [{ id: 'default', name: `${tpl.name} 默认模型` }];
+  let probedLive = false;
+  let probeNote = '';
+  let defaultModel;
+  let ephemeralSupport = tpl.ephemeralSupport;
+
   try {
-    await rpcCall('saveExtensionProvider', {
+    const probeRes = await rpcCall('probeExtensionProvider', {
       id: tpl.id,
-      name: tpl.name,
-      displayName: tpl.name,
-      protocol: tpl.protocol,
-      driverKind: tpl.protocol === 'cli' ? 'generic-cli' : 'generic-acp',
+      protocol,
+      driverKind,
       command: tpl.command,
       args: tpl.args || [],
       argsTemplate: tpl.argsTemplate || undefined,
-      models: tpl.defaultModels || [{ id: 'default', name: `${tpl.name} 默认模型` }],
-      efforts: tpl.efforts || ['low', 'medium', 'high'],
+      envPolicy,
+      cwd: getEffectiveCwd() || undefined,
+    }).catch((err) => ({ ok: false, error: err?.message || String(err) }));
+
+    if (probeRes && probeRes.ok !== false && probeRes.reachable !== false && !probeRes.error) {
+      defaultModel = probeRes.defaultModel;
+      ephemeralSupport = probeRes.ephemeralSupport ?? (probeRes.capabilities?.sessionCapabilities?.delete ? 'delete' : 'close-only');
+      if (Array.isArray(probeRes.efforts) && probeRes.efforts.length > 0) efforts = probeRes.efforts.map(String);
+      const liveModels = normalizeProbedModels(probeRes.models, efforts);
+      if (liveModels.length > 0) {
+        models = liveModels;
+        probedLive = true;
+      }
+    } else if (probeRes?.error) {
+      probeNote = String(probeRes.error);
+    }
+
+    const saved = await rpcCall('saveExtensionProvider', {
+      id: tpl.id,
+      name: tpl.name,
+      displayName: tpl.name,
+      protocol,
+      driverKind,
+      command: tpl.command,
+      args: tpl.args || [],
+      argsTemplate: tpl.argsTemplate || undefined,
+      envPolicy,
+      ephemeralSupport,
+      defaultModel,
+      models,
+      efforts,
       enabled: true,
     });
     await refreshExtensionProviders(true);
-    const caps = await rpcCall('getCapabilities', { refresh: true }).catch(() => null);
-    if (caps?.providers) {
-      state.providers = normalizeProvidersCatalog(caps.providers, state.customProviders);
+    if (saved?.providers) {
+      state.providers = normalizeProvidersCatalog(saved.providers, state.customProviders);
     }
     syncComposerSelects();
     scheduleRender();
-    showToast(`✅ 已启用扩展平台 ${tpl.name}，立即生效于控制台下拉框`, 'success');
+    if (probedLive) {
+      showToast(`已启用扩展平台 ${tpl.name}（握手同步 ${models.length} 款模型）`, 'success');
+    } else {
+      const hint = probeNote ? `（${probeNote}；请先完成登录或在「配置」中核对路径与密钥）` : '（未拉取到实时模型，请先完成登录或在「配置」中核对密钥）';
+      showToast(`已启用扩展平台 ${tpl.name}${hint}`, 'info');
+    }
   } catch (err) {
     showToast(err.message, 'error');
+  }
+}
+
+export async function toggleExtensionEnvPolicy(extId) {
+  const id = String(extId || '').trim();
+  if (!id) return false;
+  const custom = state.customProviders.find((c) => c.id === id);
+  const tpl = state.extensionTemplates.find((t) => t.id === id);
+  const src = custom || tpl;
+  if (!src) return false;
+  const current = src.envPolicy === 'minimal' ? 'minimal' : 'inherit';
+  const nextPolicy = current === 'minimal' ? 'inherit' : 'minimal';
+  const name = src.name || src.displayName || id;
+  try {
+    await rpcCall('saveExtensionProvider', {
+      id,
+      envPolicy: nextPolicy,
+      ...(custom ? {} : { command: src.command || id, enabled: false }),
+    });
+    await refreshExtensionProviders(true);
+    showToast(`已将「${name}」环境策略切换为${nextPolicy === 'minimal' ? '极简隔离' : '继承系统'}`, 'success');
+    return true;
+  } catch (err) {
+    showToast(describeRpcError(err), 'error');
+    return false;
   }
 }
 
@@ -1476,6 +1573,13 @@ function extCommandPreview(ext) {
 function renderExtensionHub() {
   const grid = document.getElementById('extension-hub-grid');
   if (!grid) return;
+  if (!grid.dataset.atEnvPolicyBound) {
+    grid.dataset.atEnvPolicyBound = '1';
+    grid.addEventListener('click', (e) => {
+      const envBtn = e.target.closest?.('[data-ext-env-policy]');
+      if (envBtn) void toggleExtensionEnvPolicy(envBtn.dataset.extEnvPolicy);
+    });
+  }
   const merged = [];
   const seen = new Set();
   for (const tpl of state.extensionTemplates) {
@@ -1485,8 +1589,8 @@ function renderExtensionHub() {
   for (const cust of state.customProviders) {
     if (!seen.has(cust.id)) merged.push({ ...cust, isBuiltinTemplate: false });
   }
-  const connected = merged.filter((e) => e.enabled || e.detected).sort((a, b) => Number(Boolean(b.enabled)) - Number(Boolean(a.enabled)));
-  const library = merged.filter((e) => !e.enabled && !e.detected);
+  const connected = merged.filter(e => e.enabled || e.detected || e.configured).sort((a, b) => Number(Boolean(b.enabled)) - Number(Boolean(a.enabled)));
+  const library = merged.filter(e => !e.enabled && !e.detected && !e.configured);
   const connectedHtml = connected.length
     ? `<div class="set-group">${connected.map(renderExtRowHtml).join('')}</div>`
     : '<div class="set-group"><p class="ext-empty">本机暂未检测到第三方 CLI，可从模板库接入，或点击「+ 自定义」</p></div>';
@@ -1504,20 +1608,26 @@ export function applyExtLibState() {
   lib.classList.toggle('is-open', state.extLibOpen);
   lib.querySelector('[data-ext-lib-toggle]')?.setAttribute('aria-expanded', String(state.extLibOpen));
 }
-function renderExtRowHtml(ext) {
+export function renderExtRowHtml(ext) {
   const id = escapeHtml(ext.id);
   const name = ext.name || ext.id;
   const cmd = extCommandPreview(ext);
-  const stateTag = ext.enabled ? '<span class="ext-state is-enabled">已启用</span>' : '<span class="ext-state is-detected">本机已检测</span>';
+  const envPolicy = ext.envPolicy === 'minimal' ? 'minimal' : 'inherit';
+  const stateTag = ext.enabled ? '<span class="ext-state is-enabled">已启用</span>'
+    : `<span class="ext-state is-detected">${ext.detected ? '本机已检测' : '已配置'}</span>`;
+  const histBadge = ext.ephemeralSupport === 'close-only'
+    ? '<span class="ext-cap-badge" title="该引擎不支持自动删除会话，默认隐藏模式下每轮新开会话且本地保留历史">本地保留历史</span>'
+    : '';
+  const envBtn = `<button type="button" class="ext-env-pill${envPolicy === 'minimal' ? ' is-minimal' : ''}" data-ext-env-policy="${id}" data-fk="ext-env:${id}" aria-label="${escapeHtml(`切换 ${name} 环境变量策略`)}" title="${envPolicy === 'minimal' ? '当前：极简隔离（仅透传基础环境与本平台密钥）· 点击切换为继承系统' : '当前：继承系统（透传当前终端全部环境变量）· 点击切换为极简隔离'}">${envPolicy === 'minimal' ? '极简环境' : '继承环境'}</button>`;
   const primary = ext.enabled
     ? `<button type="button" class="set-mini-btn is-danger" data-ext-disable="${id}" data-fk="ext-off:${id}" aria-label="${escapeHtml(`停用 ${name}`)}">停用</button>`
     : ext.isBuiltinTemplate
     ? `<button type="button" class="set-mini-btn is-primary" data-ext-enable="${id}" data-fk="ext-on:${id}" aria-label="${escapeHtml(`启用 ${name}`)}">启用</button>`
     : '';
   return `<div class="ext-row${ext.enabled ? ' is-enabled' : ''}">
-      <div class="ext-row-top"><span class="ext-row-name">${escapeHtml(name)}</span><span class="ext-proto-tag">${escapeHtml((ext.protocol || 'acp').toUpperCase())}</span>${stateTag}</div>
+      <div class="ext-row-top"><span class="ext-row-name">${escapeHtml(name)}</span><span class="ext-proto-tag">${escapeHtml((ext.protocol || 'acp').toUpperCase())}</span>${stateTag}${histBadge}</div>
       <div class="ext-row-sub is-cmd" title="${escapeHtml(ext.binaryPath || cmd)}">${escapeHtml(cmd)}</div>
-      <div class="ext-row-actions">${primary}<button type="button" class="set-mini-btn" data-ext-edit="${id}" data-fk="ext-edit:${id}" aria-label="${escapeHtml(`配置 ${name}`)}">配置</button></div>
+      <div class="ext-row-actions">${envBtn}${primary}<button type="button" class="set-mini-btn" data-ext-edit="${id}" data-fk="ext-edit:${id}" aria-label="${escapeHtml(`配置 ${name}`)}">配置</button></div>
     </div>`;
 }
 function renderExtLibRowHtml(ext) {

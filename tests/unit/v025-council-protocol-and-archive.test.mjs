@@ -386,7 +386,10 @@ test("v0.2.5 随包规则与文档去重指向按需技能，完整会审/规划
     assert.match(releaseSkill, /AGENT_TOWER_VALIDATE_STAGE_IN_REPO/);
   }
   const readme = read("README.md");
-  assert.match(readme, /AGPL-3\.0/);
+  assert.match(readme, /Apache-2\.0/);
+  assert.equal(JSON.parse(read("plugin.json")).license, "Apache-2.0");
+  assert.equal(JSON.parse(read("package.json")).license, "Apache-2.0");
+  assert.match(read("LICENSE"), /Apache License[\s\S]*Version 2\.0/);
   assert.doesNotMatch(readme, /AGENT_TOWER_VALIDATE_STAGE_IN_REPO/);
   assert.doesNotMatch(readme, /[A-Za-z]:[\\/]Users[\\/](?!<user>)/);
   if (fs.existsSync(path.join(repoRoot, ".agent-tower/docs/STORAGE_AND_TESTING.md"))) {

@@ -38,14 +38,18 @@ import {
 } from "./generic-cli.mjs";
 import { runKimiTurn } from "./kimi-acp.mjs";
 import { createWarmPool } from "./warm-pool.mjs";
+import { probeZCodeProvider, runZCodeTurn } from "./zcode-driver.mjs";
 import {
   detectCommandOnSystem,
+  redactSensitiveText,
   resolveAgyBinary,
   resolveCodexBinary,
   resolveClaudeBinary,
+  resolveDshBinary,
   resolveExternalCommand,
   resolveHostAgentApiBinary,
   resolveKimiBinary,
+  resolveZCodeBinary,
 } from "./proc-utils.mjs";
 
 export {
@@ -57,19 +61,40 @@ export {
   ingestNativeConversation,
   probeAcpProvider,
   probeCliProvider,
+  probeZCodeProvider,
+  redactSensitiveText,
   readNativeConversationTitle,
   readNativeSwarmSnapshot,
   readNativeTranscriptSnapshot,
   resolveConversationRoot,
   resolveDefaultAppDataDir,
+  resolveDshBinary,
   resolveExternalCommand,
   resolveHostAgentApiBinary,
   resolveNativeSwarmLocation,
   resolveTranscriptPath,
+  resolveZCodeBinary,
   runAgyNativeTurn,
   runGenericAcpTurn,
   runGenericCliTurn,
+  runZCodeTurn,
 };
+
+function extensionProtocol(id, { protocol, driverKind }) {
+  const wire = String(protocol || "").trim().toLowerCase();
+  if (wire === "zcode" || driverKind === "zcode" || id === "zcode" && !["acp", "cli"].includes(wire)) return "zcode";
+  return wire === "cli" ? "cli" : "acp";
+}
+
+function mergeExtensionConfig(template, config, id) {
+  const merged = { ...template, ...config, id };
+  if ((config?.protocol || config?.driverKind === "zcode") &&
+      extensionProtocol(id, config) !== extensionProtocol(id, template || {})) {
+    merged.args = config.args;
+    merged.driverKind = config.driverKind;
+  }
+  return merged;
+}
 
 function findTemplateById(id = "") {
   const key = String(id || "").trim().toLowerCase();
@@ -151,12 +176,9 @@ export function createEngineManager({
 
   function resolveExtensionConfig(providerId, opts = {}) {
     if (opts.providerConfig && typeof opts.providerConfig === "object") {
+      if (opts.providerConfig.enabled === false) return { ...opts.providerConfig, _disabled: true };
       const tpl = findTemplateById(opts.providerConfig.templateId || providerId);
-      return {
-        ...(tpl || {}),
-        ...opts.providerConfig,
-        id: providerId,
-      };
+      return mergeExtensionConfig(tpl, opts.providerConfig, providerId);
     }
 
     const customList = Array.isArray(opts.customProviders)
@@ -176,11 +198,7 @@ export function createEngineManager({
         return { ...matchedCustom, _disabled: true };
       }
       const tpl = findTemplateById(matchedCustom.templateId || providerId);
-      return {
-        ...(tpl || {}),
-        ...matchedCustom,
-        id: providerId,
-      };
+      return mergeExtensionConfig(tpl, matchedCustom, providerId);
     }
 
     const tpl = findTemplateById(providerId);
@@ -347,17 +365,19 @@ export function createEngineManager({
           customProviders: customList,
         });
 
-        if (extCfg && !extCfg._disabled && extCfg.command) {
-          const protocol = String(extCfg.protocol || "acp").trim().toLowerCase();
-          if (protocol === "cli") {
+        const protocol = extensionProtocol(provider, extCfg || {});
+        if (!extCfg?._disabled && (extCfg?.command || protocol === "zcode" || provider === "dsh")) {
+          if (protocol === "zcode") {
+            handle = runZCodeTurn({ ...driverOpts, providerConfig: extCfg ?? {} });
+          } else if (protocol === "cli") {
             handle = runGenericCliTurn({
               ...driverOpts,
-              providerConfig: extCfg,
+              providerConfig: extCfg ?? {},
             });
           } else {
             handle = runGenericAcpTurn({
               ...driverOpts,
-              providerConfig: extCfg,
+              providerConfig: extCfg ?? {},
             });
           }
         } else {
@@ -407,33 +427,14 @@ export function createEngineManager({
       const templateId = cfg.templateId || cfg.id || "";
       const tpl = findTemplateById(templateId);
       const id = normalizeProviderId(cfg.id || tpl?.id || "custom-acp") || "custom-acp";
-      const protocol = String(cfg.protocol || tpl?.protocol || "acp").trim().toLowerCase();
-      const command = String(cfg.command || tpl?.command || "").trim();
-      const args = cfg.args !== undefined ? cfg.args : tpl?.args || (protocol === "acp" ? ["acp"] : []);
-      const extraCandidatePaths =
-        cfg.extraCandidatePaths || tpl?.extraCandidatePaths || [];
-
-      if (protocol === "cli") {
-        return probeCliProvider({
-          id,
-          command,
-          argsTemplate: args,
-          env: cfg.env || {},
-          cwd: nativePath(cfg.cwd || process.env.AGENT_TOWER_DEFAULT_ROOT || ensureMainRoot()),
-          timeoutMs: cfg.timeoutMs || 6000,
-          extraCandidatePaths,
-        });
-      }
-
-      return probeAcpProvider({
-        id,
-        command,
-        args,
-        env: cfg.env || {},
-        cwd: nativePath(cfg.cwd || process.env.AGENT_TOWER_DEFAULT_ROOT || ensureMainRoot()),
-        timeoutMs: cfg.timeoutMs || 12000,
-        extraCandidatePaths,
-      });
+      const config = mergeExtensionConfig(tpl, cfg, id);
+      const protocol = extensionProtocol(id, config);
+      const options = {
+        ...config, extraCandidatePaths: config.candidatePaths ?? config.extraCandidatePaths,
+      };
+      if (protocol === "zcode") return probeZCodeProvider(options);
+      if (protocol === "cli") return probeCliProvider({ ...options, args: cfg.probeArgs });
+      return probeAcpProvider({ timeoutMs: 12000, ...options });
     },
 
     /**

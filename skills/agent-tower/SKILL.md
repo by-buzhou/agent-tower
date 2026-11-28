@@ -3,7 +3,7 @@ name: agent-tower
 description: 在AgentTower中调度当前宿主会话的外部 Agent、跟踪任务、审查并修复代码，或使用隔离工作树并行开发。
 ---
 
-# AgentTower v0.3.4
+# AgentTower v0.3.5
 
 通过宿主加载的 `agent-tower_orchestrator` 工具组工作。需要展示实时进度时，在回复中附上面板入口。[AgentTower](sidecar://agent-tower/studio/)
 

@@ -6,8 +6,12 @@ import {
   spawnNoWindow,
   buildCleanChildEnv,
   classifyErrorCategory,
+  extensionEnvOptions,
   forceKillProcessTree,
+  isEngineAuthenticationError,
+  redactSensitiveText,
   resolveExternalCommand,
+  safeEngineError,
 } from "./proc-utils.mjs";
 
 function tokenizeArgsTemplate(template) {
@@ -91,9 +95,13 @@ export function expandCliTemplateArgs(argsTemplate, vars = {}) {
  * Probe whether a non-ACP CLI command exists and responds on the local machine.
  */
 export async function probeCliProvider({
+  id,
   command,
   args = ["--version"],
   env = {},
+  envPolicy,
+  credentialEnvKeys,
+  extraCandidatePaths,
   cwd,
   timeoutMs = 5000,
 } = {}) {
@@ -103,7 +111,9 @@ export async function probeCliProvider({
   }
 
   const checkArgs = Array.isArray(args) && args.length > 0 ? args.map(String) : ["--version"];
-  const resolved = resolveExternalCommand(command, checkArgs);
+  let resolved;
+  try { resolved = resolveExternalCommand(command, checkArgs, extraCandidatePaths); }
+  catch (err) { return { ok: false, protocol: "cli", error: safeEngineError(err) }; }
 
   return new Promise((resolve) => {
     let settled = false;
@@ -116,10 +126,10 @@ export async function probeCliProvider({
         cwd,
         stdio: ["ignore", "pipe", "pipe"],
 
-        env: buildCleanChildEnv({ ...resolved.env, ...(env || {}) }),
+        env: buildCleanChildEnv({ ...resolved.env, ...env }, extensionEnvOptions(id, { envPolicy, credentialEnvKeys })),
       });
     } catch (err) {
-      resolve({ ok: false, protocol: "cli", error: err.message });
+      resolve({ ok: false, protocol: "cli", error: safeEngineError(err) });
       return;
     }
 
@@ -128,19 +138,19 @@ export async function probeCliProvider({
       settled = true;
       await forceKillProcessTree(proc);
       resolve({
-        ok: Boolean(resolved.resolvedPath),
+        ok: false,
         protocol: "cli",
         binaryPath: resolved.resolvedPath || resolved.command,
-        versionOutput: (outBuf || errBuf).trim().slice(0, 200) || "timeout (binary exists)",
+        error: "CLI probe timed out",
       });
     }, Math.max(1500, Number(timeoutMs) || 5000));
     timer.unref?.();
 
     proc.stdout?.on("data", (d) => {
-      outBuf = (outBuf + d.toString("utf-8")).slice(0, 2000);
+      outBuf = (outBuf + d).slice(0, 8192);
     });
     proc.stderr?.on("data", (d) => {
-      errBuf = (errBuf + d.toString("utf-8")).slice(0, 2000);
+      errBuf = (errBuf + d).slice(0, 8192);
     });
 
     proc.once("error", (err) => {
@@ -151,17 +161,18 @@ export async function probeCliProvider({
         ok: false,
         protocol: "cli",
         binaryPath: resolved.resolvedPath || null,
-        error: err.message,
+        error: safeEngineError(err),
       });
     });
 
-    proc.once("exit", (code) => {
+    proc.once("close", (code) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      const combined = (outBuf || errBuf).trim();
+      const combined = redactSensitiveText(outBuf || errBuf).trim();
       const firstLine = combined.split(/\r?\n/)[0] || "";
-      if (code === 0 || Boolean(resolved.resolvedPath && combined)) {
+      const authError = code !== 0 && isEngineAuthenticationError(redactSensitiveText(errBuf || outBuf));
+      if (code === 0) {
         resolve({
           ok: true,
           protocol: "cli",
@@ -173,7 +184,7 @@ export async function probeCliProvider({
           ok: false,
           protocol: "cli",
           binaryPath: resolved.resolvedPath || null,
-          error: firstLine || `Exited with code ${code}`,
+          error: safeEngineError(authError ? errBuf || outBuf : firstLine, `Exited with code ${code}`),
         });
       }
     });
@@ -193,6 +204,7 @@ export function runGenericCliTurn({
   effort = "",
   cwd,
   nativeSessionId = "",
+  ephemeral = false,
   prompt = "",
   freshSessionPrompt,
   onEvent,
@@ -200,7 +212,7 @@ export function runGenericCliTurn({
   cwd = nativePath(cwd || process.env.AGENT_TOWER_DEFAULT_ROOT || ensureMainRoot());
   const rawCommand = providerConfig.command || provider;
   const template = providerConfig.argsTemplate ?? providerConfig.args ?? ["{{prompt}}"];
-  const resumeId = tokenizeArgsTemplate(template).some(token => token.includes("{{sessionId}}")) ? nativeSessionId : "";
+  const resumeId = !ephemeral && tokenizeArgsTemplate(template).some(token => token.includes("{{sessionId}}")) ? nativeSessionId : "";
   const selectedModel = model || providerConfig.defaultModel || "";
   const expandedArgs = expandCliTemplateArgs(template, {
     model: isInheritedModel(selectedModel) ? "" : selectedModel,
@@ -218,6 +230,12 @@ export function runGenericCliTurn({
   let assistantText = "";
   let reasoningText = "";
   let stderrTail = "";
+  let inDiagnostics = false;
+  const publicOutput = value => {
+    if (inDiagnostics) return "";
+    if (/\bFull diagnostics:/i.test(value)) inDiagnostics = true;
+    return redactSensitiveText(value);
+  };
 
   const emit = (evt) => {
     try {
@@ -234,7 +252,7 @@ export function runGenericCliTurn({
   const result = (async () => {
     let rl;
     try {
-      const resolved = resolveExternalCommand(rawCommand, expandedArgs, providerConfig.candidatePaths || []);
+      const resolved = resolveExternalCommand(rawCommand, expandedArgs, providerConfig.candidatePaths ?? providerConfig.extraCandidatePaths);
       proc = spawnNoWindow(resolved.command, resolved.args, {
         cwd,
         stdio: ["ignore", "pipe", "pipe"],
@@ -242,7 +260,7 @@ export function runGenericCliTurn({
         env: buildCleanChildEnv({
           ...resolved.env,
           ...(providerConfig.env && typeof providerConfig.env === "object" ? providerConfig.env : {}),
-        }),
+        }, extensionEnvOptions(provider, providerConfig)),
       });
       let spawnError;
       const exitPromise = new Promise(resolve => {
@@ -254,7 +272,8 @@ export function runGenericCliTurn({
         });
         proc.once("close", code => resolve(code ?? 1));
       });
-      proc.stderr?.on("data", chunk => { stderrTail = (stderrTail + chunk.toString("utf8")).slice(-2000); });
+      // Retain the diagnostics header even when the child prints a large crash block.
+      proc.stderr?.on("data", chunk => { stderrTail = (stderrTail + chunk).slice(0, 8192); });
       rl = readline.createInterface({ input: proc.stdout, crlfDelay: Infinity });
       for await (const line of rl) {
         const trimmed = line.trim();
@@ -271,15 +290,16 @@ export function runGenericCliTurn({
           try {
             const obj = JSON.parse(trimmed);
             const sid = obj.session_id || obj.sessionId || obj.thread_id || obj.conversation_id;
-            if (sid && sid !== boundSessionId) {
+            if (!ephemeral && sid && sid !== boundSessionId) {
               boundSessionId = String(sid);
               emit({ type: "session_bound", nativeSessionId: boundSessionId, sessionId: boundSessionId, resumed: boundSessionId === resumeId });
             }
 
             const think = obj.thinking || obj.reasoning || obj.thought_delta;
             if (typeof think === "string" && think) {
-              reasoningText += think;
-              emit({ type: "reasoning_delta", delta: think, text: think });
+              const delta = publicOutput(think);
+              reasoningText += delta;
+              if (delta) emit({ type: "reasoning_delta", delta, text: delta });
             }
 
             const msg =
@@ -291,8 +311,9 @@ export function runGenericCliTurn({
               (typeof obj.response === "string" ? obj.response : undefined);
 
             if (typeof msg === "string" && msg) {
-              assistantText += msg;
-              emit({ type: "message_delta", delta: msg, text: msg, phase: "final_answer" });
+              const delta = publicOutput(msg);
+              assistantText += delta;
+              if (delta) emit({ type: "message_delta", delta, text: delta, phase: "final_answer" });
             }
             continue;
           } catch {
@@ -300,7 +321,8 @@ export function runGenericCliTurn({
           }
         }
 
-        const chunk = `${line}\n`;
+        const chunk = publicOutput(`${line}\n`);
+        if (!chunk) continue;
         assistantText += chunk;
         emit({ type: "message_delta", delta: chunk, text: chunk, phase: "final_answer" });
       }
@@ -321,7 +343,7 @@ export function runGenericCliTurn({
       }
 
       if (exitCode !== 0) {
-        const errMsg = stderrTail.trim() || `${rawCommand} exited with code ${exitCode}`;
+        const errMsg = safeEngineError(stderrTail, `CLI exited with code ${exitCode}`);
         emit({
           type: "error",
           message: errMsg,
@@ -335,6 +357,7 @@ export function runGenericCliTurn({
           assistantText: assistantText.trim(),
           reasoningText: reasoningText.trim(),
           error: errMsg,
+          category: classifyErrorCategory(errMsg),
         };
       }
 
@@ -357,7 +380,7 @@ export function runGenericCliTurn({
           reasoningText: reasoningText.trim(),
         };
       }
-      const errMsg = err?.message || String(err);
+      const errMsg = safeEngineError(err);
       emit({
         type: "error",
         message: errMsg,
@@ -371,6 +394,7 @@ export function runGenericCliTurn({
         assistantText: assistantText.trim(),
         reasoningText: reasoningText.trim(),
         error: errMsg,
+        category: classifyErrorCategory(errMsg),
       };
     } finally { rl?.close(); }
   })();
